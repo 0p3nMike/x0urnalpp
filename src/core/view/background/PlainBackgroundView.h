@@ -31,5 +31,8 @@ protected:
     Color backgroundColor;
 
     static std::pair<int, int> getIndexBounds(double min, double max, double step, double margin, double length);
+
+    /// X0urnal++: grid indices with no page-edge clamp -- see the .cpp.
+    static std::pair<int, int> getIndexBoundsUnbounded(double min, double max, double step);
 };
 };  // namespace xoj::view

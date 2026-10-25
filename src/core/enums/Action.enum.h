@@ -99,6 +99,11 @@ enum class Action : size_t {
     DELETE_PAGE,
     PAPER_FORMAT,
     PAPER_BACKGROUND_COLOR,
+    TOGGLE_INFINITE_CANVAS,  // X0urnal++
+    NOTEBOOK_NEW,      // X0urnal++
+    NOTEBOOK_OPEN,     // X0urnal++
+    NOTEBOOK_CLOSE,    // X0urnal++
+    NOTEBOOK_OPEN_PATH,  // X0urnal++
 
     // Menu Tools
     SELECT_TOOL,

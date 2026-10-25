@@ -62,6 +62,7 @@
 #include "gui/inputdevices/SetsquareInputHandler.h"              // for Sets...
 #include "gui/menus/menubar/Menubar.h"                           // for Menubar
 #include "gui/sidebar/Sidebar.h"                                 // for Sidebar
+#include "control/notebook/NotebookController.h"  // X0urnal++
 #include "gui/toolbarMenubar/ToolMenuHandler.h"                  // for Tool...
 #include "gui/toolbarMenubar/model/ToolbarData.h"                // for Tool...
 #include "gui/toolbarMenubar/model/ToolbarModel.h"               // for Tool...
@@ -956,6 +957,82 @@ void Control::paperTemplate() {
     popup.show(GTK_WINDOW(this->win->getWindow()));
 }
 
+namespace {
+/* X0urnal++: the infinite-canvas switch as an undo step of its own, so the notebook's autosave
+   (which follows the undo history) writes it, and Undo puts it back. */
+class InfiniteCanvasUndoAction: public UndoAction {
+public:
+    InfiniteCanvasUndoAction(PageRef p, bool nowInfinite): UndoAction("InfiniteCanvasUndoAction"), on(nowInfinite) {
+        this->page = std::move(p);
+    }
+    bool undo(Control* control) override { return set(control, !on, true); }
+    bool redo(Control* control) override { return set(control, on, false); }
+    std::string getText() override { return _("Infinite canvas"); }
+
+private:
+    bool set(Control* control, bool value, bool undoneNow) {
+        this->page->setInfiniteCanvas(value);
+        Document* doc = control->getDocument();
+        doc->lock();
+        const size_t n = doc->indexOf(this->page);
+        doc->unlock();
+        if (n != npos) {
+            control->firePageSizeChanged(n);
+        }
+        this->undone = undoneNow;
+        return true;
+    }
+    bool on;
+};
+}  // namespace
+
+/*
+ * X0urnal++: flip the current page between an ordinary bounded sheet and an
+ * infinite whiteboard.
+ */
+void Control::toggleInfiniteCanvas() {
+    auto const& page = getCurrentPage();
+    /* A PDF page's size is the size of the PDF, so it is never infinite --
+       XojPage::isInfiniteCanvas() enforces that too. Bail the same way
+       paperFormat() does. */
+    if (!page || page->getBackgroundType().isPdfPage()) {
+        return;
+    }
+    clearSelectionEndText();
+
+    const bool wasInfinite = page->isInfiniteCanvas();
+    page->setInfiniteCanvas(!wasInfinite);
+
+    if (!wasInfinite) {
+        /* Give the page room to actually be a whiteboard. A page keeps whatever
+           size it had, so an A4-sized "infinite" page would be a confusing
+           no-op. 150 cm square is deliberate: unbounded-feeling at normal zoom,
+           and cheap because only the viewport is rasterised (69.0 MB -> 7.5 MB of
+           render buffer for this page, see view/ViewportBuffer.h). */
+        constexpr double WHITEBOARD_SIDE = 150.0 * 28.3465;  // 150 cm in points
+        const double oldW = page->getWidth();
+        const double oldH = page->getHeight();
+        if (oldW < WHITEBOARD_SIDE || oldH < WHITEBOARD_SIDE) {
+            this->doc->lock();
+            Document::setPageSize(page, std::max(oldW, WHITEBOARD_SIDE), std::max(oldH, WHITEBOARD_SIDE));
+            this->doc->unlock();
+            this->undoRedo->addUndoAction(std::make_unique<PageSizeChangeUndoAction>(page, oldW, oldH));
+        }
+    }
+    /* Turning it OFF leaves the size alone on purpose: shrinking back could put
+       existing strokes outside the page, and silently hiding someone's work is
+       worse than leaving a large sheet behind. */
+    this->undoRedo->addUndoAction(std::make_unique<InfiniteCanvasUndoAction>(page, !wasInfinite));  // X0urnal++
+
+    this->doc->lock();
+    const size_t pageNo = this->doc->indexOf(page);
+    const size_t pageCount = this->doc->getPageCount();
+    this->doc->unlock();
+    if (pageNo != npos && pageNo < pageCount) {
+        firePageSizeChanged(pageNo);
+    }
+}
+
 void Control::paperFormat() {
     auto const& page = getCurrentPage();
     if (!page || page->getBackgroundType().isPdfPage()) {
@@ -1663,6 +1740,16 @@ void Control::openFileWithoutSavingTheCurrentDocument(fs::path filepath, bool at
         return;
     }
 
+    /* X0urnal++: a notebook -- a `.book` folder, or an old zipped `.book` -- opens as a
+       notebook: an empty document first (the app is never without one, and the startup
+       callback must run), then the book, its tree and the page you were on. */
+    if (getNotebookController()->shouldOpenAsNotebook(filepath)) {
+        this->replaceDocument(createNewDocument(this, fs::path(), std::nullopt), -1);
+        callback(true);
+        getNotebookController()->openNotebook(filepath);
+        return;
+    }
+
     if (std::error_code err; !fs::exists(filepath, err)) {
         std::string message =
                 err ? FS(_F("Failed to determine if path exists \"{1}\": {2}") % filepath.u8string() % err.message()) :
@@ -1967,6 +2054,14 @@ void Control::showColorChooserDialog() {
 }
 
 void Control::updateWindowTitle() {
+    /* X0urnal++: a page of the open book is titled by its names in the book. */
+    if (this->notebookController) {
+        if (std::string t = this->notebookController->windowTitle(); !t.empty()) {
+            gtk_window_set_title(getGtkWindow(), (t + " - X0urnal++").c_str());
+            return;
+        }
+    }
+
     std::string title{};  ///< Actually a UTF-8 string
 
     this->doc->lock_shared();
@@ -1988,7 +2083,7 @@ void Control::updateWindowTitle() {
     }
     this->doc->unlock_shared();
 
-    title += " - Xournal++";
+    title += " - X0urnal++";
 
     gtk_window_set_title(getGtkWindow(), title.c_str());
 }
@@ -2089,6 +2184,7 @@ void Control::quit(bool allowCancel) {
             this->scheduler->removeAllJobs();
             this->scheduler->unlock();
             this->scheduler->stop();  // Finish current task. Must be called to finish pending saves.
+            this->getNotebookController()->onQuit();  // X0urnal++: commit + send the open book
             this->closeDocument();    // Must be done after all jobs has finished (Segfault on save/export)
             settings->save();
             g_application_quit(G_APPLICATION(gtkApp));
@@ -2110,6 +2206,16 @@ void Control::close(std::function<void(bool)> callback, const bool allowDestroy,
 
     resetGeometryTool();
 
+    /* X0urnal++: a page of an open notebook is saved, never asked about. */
+    if (!forceClose && undoRedo->isChanged() &&
+        getNotebookController()->saveInsteadOfAsking(
+                [ctrl = this, callback, allowDestroy, allowCancel](bool saved) mutable {
+                    /* saved: close for real (forceClose -- it was just written); not
+                       saved: saveInsteadOfAsking now declines, so close() asks. */
+                    ctrl->close(std::move(callback), allowDestroy, allowCancel, saved);
+                })) {
+        return;
+    }
     bool safeToClose = forceClose || !undoRedo->isChanged();
     if (!safeToClose) {
         fs::path path = doc->getFilepath();
@@ -2570,6 +2676,16 @@ auto Control::getScrollHandler() const -> ScrollHandler* { return this->scrollHa
 auto Control::getMetadataManager() const -> MetadataManager* { return this->metadata; }
 
 auto Control::getSidebar() const -> Sidebar* { return this->sidebar; }
+
+/* X0urnal++: created on first use so Control's constructor is untouched -- the
+   controller needs a fully built Control to open documents through. */
+auto Control::getNotebookController() const -> x0urnal::NotebookController* {
+    if (!this->notebookController) {
+        const_cast<Control*>(this)->notebookController =
+                std::make_unique<x0urnal::NotebookController>(const_cast<Control*>(this));
+    }
+    return this->notebookController.get();
+}
 
 auto Control::getSearchBar() const -> SearchBar* { return this->searchBar; }
 

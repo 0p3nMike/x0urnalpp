@@ -20,7 +20,7 @@
 using xoj::util::Rectangle;
 
 Text::Text(): AudioElement(ELEMENT_TEXT) {
-    this->font.setName("Sans");
+    this->font.setName("BigBlueTerm437 Nerd Font Mono");  // X0urnal++
     this->font.setSize(12);
 }
 

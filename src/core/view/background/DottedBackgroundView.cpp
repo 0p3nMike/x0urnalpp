@@ -34,10 +34,15 @@ void DottedBackgroundView::draw(cairo_t* cr) const {
      *     (partially) visible
      *  2- Set clearance so no dot is half-drawn on the edge of the sheet
      */
+    /* X0urnal++: on an infinite canvas the dots follow the clip rather than
+       stopping at the page edge. (This one passes halfLineWidth as the margin
+       where the graph view passes `clearance` -- same clamp, different value.) */
     auto [indexMinX, indexMaxX] =
-            getIndexBounds(minX - halfLineWidth, maxX + halfLineWidth, squareSize, halfLineWidth, pageWidth);
+            unbounded ? getIndexBoundsUnbounded(minX - halfLineWidth, maxX + halfLineWidth, squareSize)
+                      : getIndexBounds(minX - halfLineWidth, maxX + halfLineWidth, squareSize, halfLineWidth, pageWidth);
     auto [indexMinY, indexMaxY] =
-            getIndexBounds(minY - halfLineWidth, maxY + halfLineWidth, squareSize, halfLineWidth, pageHeight);
+            unbounded ? getIndexBoundsUnbounded(minY - halfLineWidth, maxY + halfLineWidth, squareSize)
+                      : getIndexBounds(minY - halfLineWidth, maxY + halfLineWidth, squareSize, halfLineWidth, pageHeight);
 
     for (int i = indexMinX; i <= indexMaxX; ++i) {
         double x = i * squareSize;

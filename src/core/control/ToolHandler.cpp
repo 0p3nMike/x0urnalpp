@@ -54,7 +54,8 @@ void ToolHandler::initTools() {
     thickness[TOOL_SIZE_MEDIUM] = 1.41;
     thickness[TOOL_SIZE_THICK] = 2.26;
     thickness[TOOL_SIZE_VERY_THICK] = 5.67;
-    tools[TOOL_PEN - TOOL_PEN] = std::make_unique<Tool>("pen", TOOL_PEN, Colors::xopp_royalblue, thickness);
+    // X0urnal++: the ink is bone on black paper; the highlighter is gold.
+    tools[TOOL_PEN - TOOL_PEN] = std::make_unique<Tool>("pen", TOOL_PEN, Color{0xffd8d4c4U}, thickness);
 
     thickness[TOOL_SIZE_VERY_FINE] = 1;
     thickness[TOOL_SIZE_FINE] = 2.83;
@@ -70,9 +71,9 @@ void ToolHandler::initTools() {
     thickness[TOOL_SIZE_THICK] = 19.84;
     thickness[TOOL_SIZE_VERY_THICK] = 30;
     tools[TOOL_HIGHLIGHTER - TOOL_PEN] =
-            std::make_unique<Tool>("highlighter", TOOL_HIGHLIGHTER, Colors::yellow, thickness);
+            std::make_unique<Tool>("highlighter", TOOL_HIGHLIGHTER, Color{0xffd4a843U}, thickness);  // X0urnal++
 
-    tools[TOOL_TEXT - TOOL_PEN] = std::make_unique<Tool>("text", TOOL_TEXT, Colors::black, std::nullopt);
+    tools[TOOL_TEXT - TOOL_PEN] = std::make_unique<Tool>("text", TOOL_TEXT, Color{0xffd8d4c4U}, std::nullopt);  // X0urnal++
 
     tools[TOOL_IMAGE - TOOL_PEN] = std::make_unique<Tool>("image", TOOL_IMAGE, Colors::black, std::nullopt);
 

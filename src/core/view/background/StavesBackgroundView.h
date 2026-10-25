@@ -29,7 +29,7 @@ public:
 
 protected:
     constexpr static Color DEFAULT_LINE_COLOR = Colors::black;
-    constexpr static Color ALT_DEFAULT_LINE_COLOR = Colors::white;
+    constexpr static Color ALT_DEFAULT_LINE_COLOR = Color{0xffd8d4c4U};  // X0urnal++
     constexpr static double DEFAULT_LINE_WIDTH = 0.5;
 
     constexpr static double HEADER_SIZE = 80.0;

@@ -39,10 +39,10 @@
 
 #ifdef GHC_FILESYSTEM
 // Fix of ghc::filesystem bug (path::operator/=() won't support string_views)
-constexpr auto const* CONFIG_FOLDER_NAME = "xournalpp";
+constexpr auto const* CONFIG_FOLDER_NAME = "X0urnal++";  // X0urnal++: own settings, own toolbar.ini
 #else
 using namespace std::string_view_literals;
-constexpr auto CONFIG_FOLDER_NAME = "xournalpp"sv;
+constexpr auto CONFIG_FOLDER_NAME = "X0urnal++"sv;  // X0urnal++: own settings, own toolbar.ini
 #endif
 
 #ifdef _WIN32

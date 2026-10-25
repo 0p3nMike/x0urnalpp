@@ -49,6 +49,8 @@
 #include "config.h"        // for GETTEXT_PACKAGE, ENABLE_NLS
 #include "filesystem.h"    // for path, operator/, exists
 
+#include "control/notebook/NotebookController.h"  // X0urnal++
+
 namespace {
 
 constexpr auto APP_FLAGS =
@@ -484,6 +486,11 @@ void on_startup(GApplication* application, XMPtr app_data) {
                 p = fs::path();
             }
         }
+    }
+
+    /* X0urnal++: no file given -> the notebook you were in, on the page you were on. */
+    if (p.empty()) {
+        p = x0urnal::NotebookController::lastNotebook();
     }
 
     app_data->control->openFileWithoutSavingTheCurrentDocument(

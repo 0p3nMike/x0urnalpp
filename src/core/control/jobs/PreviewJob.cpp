@@ -43,6 +43,17 @@ void PreviewJob::initGraphics() {
     double zoom = this->sidebarPreview->sidebar->getZoom();
     cairo_translate(cr.get(), Shadow::getShadowTopLeftSize() + 2, Shadow::getShadowTopLeftSize() + 2);
     cairo_scale(cr.get(), zoom, zoom);
+
+    /*
+     * X0urnal++: put the content box at the preview's origin for an infinite
+     * canvas, matching the size SidebarPreviewBaseEntry::updateSize chose. The
+     * page is still drawn whole; the transform decides which part of it lands
+     * in the thumbnail.
+     */
+    if (const ConstPageRef pg = this->sidebarPreview->page; pg && pg->isInfiniteCanvas()) {
+        const auto box = pg->contentBounds();
+        cairo_translate(cr.get(), -box.x, -box.y);
+    }
 }
 
 void PreviewJob::finishPaint() {

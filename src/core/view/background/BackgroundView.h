@@ -47,6 +47,13 @@ public:
 protected:
     double pageWidth;
     double pageHeight;
+
+    /**
+     * X0urnal++: draw the paper beyond the page rectangle, including at negative
+     * coordinates, for an infinite-canvas page. See
+     * PlainBackgroundView::getIndexBounds.
+     */
+    bool unbounded = false;
 };
 };  // namespace view
 };  // namespace xoj

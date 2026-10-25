@@ -14,6 +14,7 @@
 #include "gui/GladeGui.h"                            // for GladeGui
 #include "gui/sidebar/AbstractSidebarPage.h"         // for AbstractSidebar...
 #include "gui/sidebar/indextree/SidebarIndexPage.h"  // for SidebarIndexPage
+#include "gui/sidebar/notebook/SidebarNotebookPage.h"  // X0urnal++
 #include "model/Document.h"                          // for Document
 #include "model/XojPage.h"                           // for XojPage
 #include "pdf/base/XojPdfPage.h"                     // for XojPdfPageSPtr
@@ -36,6 +37,7 @@ Sidebar::Sidebar(GladeGui* gui, Control* control): control(control) {
 }
 
 void Sidebar::initTabs(GtkWidget* sidebarContents) {
+    addTab(std::make_unique<SidebarNotebookPage>(this->control));  // X0urnal++
     addTab(std::make_unique<SidebarIndexPage>(this->control));
     addTab(std::make_unique<SidebarPreviewPages>(this->control));
     addTab(std::make_unique<SidebarPreviewLayers>(this->control, false));

@@ -22,6 +22,19 @@
      <attribute name="label" translatable="yes">_Annotate PDF</attribute>
      <attribute name="action">win.annotate-pdf</attribute>
     </item>
+    <!-- X0urnal++: notebooks -- book, chapters, infinite pages -->
+    <item>
+     <attribute name="label" translatable="yes">_New Notebook</attribute>
+     <attribute name="action">win.notebook-new</attribute>
+    </item>
+    <item>
+     <attribute name="label" translatable="yes">Open No_tebook</attribute>
+     <attribute name="action">win.notebook-open</attribute>
+    </item>
+    <item>
+     <attribute name="label" translatable="yes">_Close Notebook</attribute>
+     <attribute name="action">win.notebook-close</attribute>
+    </item>
     <item>
      <attribute name="label" translatable="yes">Save</attribute>
      <attribute name="action">win.save</attribute>
@@ -497,6 +510,11 @@
     <item>
      <attribute name="label" translatable="yes">Paper _Color</attribute>
      <attribute name="action">win.paper-background-color</attribute>
+    </item>
+    <!-- X0urnal++: turn this page into an infinite whiteboard -->
+    <item>
+     <attribute name="label" translatable="yes">_Infinite Canvas</attribute>
+     <attribute name="action">win.toggle-infinite-canvas</attribute>
     </item>
     <submenu id="menuJournalPaperBackground">
      <attribute name="label" translatable="yes">Paper B_ackground</attribute>

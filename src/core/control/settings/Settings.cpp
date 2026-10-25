@@ -1,5 +1,12 @@
 #include "Settings.h"
 
+#include <fstream>  // X0urnal++ theme
+#include <map>      // X0urnal++ theme
+#include <sstream>  // X0urnal++ theme
+#include <string>   // X0urnal++ theme
+
+#include <glib.h>  // X0urnal++ theme
+
 #include <algorithm>    // for max
 #include <cstdint>      // for uint32_t, int32_t
 #include <cstdio>       // for sscanf, size_t
@@ -35,7 +42,7 @@
 
 using std::string;
 
-constexpr auto const* DEFAULT_FONT = "Sans";
+constexpr auto const* DEFAULT_FONT = "BigBlueTerm437 Nerd Font Mono";  // X0urnal++: the house font is the text tool default
 constexpr auto DEFAULT_FONT_SIZE = 12;
 constexpr auto DEFAULT_TOOLBAR = "Portrait";
 
@@ -48,6 +55,55 @@ constexpr auto DEFAULT_TOOLBAR = "Portrait";
 #define ATTACH_COMMENT(var)                     \
     com = xmlNewComment((const xmlChar*)(var)); \
     xmlAddPrevSibling(xmlNode, com);
+
+
+// X0urnal++ theme: the colours Settings holds (selection border and marker, active search hit,
+// canvas background) follow the house map, ~/.config/sw4tch/house-map: one `<house hex> <themed
+// hex>` line per house colour, written by a theme switcher such as sw4tch. No file, or an empty
+// one, keeps the house colours. Getters theme (house -> theme); setters un-theme (theme -> house)
+// so settings.xml always keeps the house colour, whatever theme was live when Preferences was saved.
+namespace {
+auto loadHouseMap() -> std::map<uint32_t, uint32_t> {
+    std::map<uint32_t, uint32_t> t;
+    std::ifstream in(std::string(g_get_home_dir()) + "/.config/sw4tch/house-map");
+    for (std::string line; std::getline(in, line);) {
+        std::istringstream words(line.substr(0, line.find('#')));
+        std::string from, to;
+        if (words >> from >> to && from.size() == 6 && to.size() == 6) {
+            char* endFrom = nullptr;
+            char* endTo = nullptr;
+            auto f = std::strtoul(from.c_str(), &endFrom, 16);
+            auto v = std::strtoul(to.c_str(), &endTo, 16);
+            if (*endFrom == 0 && *endTo == 0) {
+                t[static_cast<uint32_t>(f)] = static_cast<uint32_t>(v);
+            }
+        }
+    }
+    return t;
+}
+auto houseMapMut() -> std::map<uint32_t, uint32_t>& {
+    static std::map<uint32_t, uint32_t> table = loadHouseMap();
+    return table;
+}
+auto houseMap() -> const std::map<uint32_t, uint32_t>& { return houseMapMut(); }
+auto houseThemed(Color c) -> Color {
+    auto v = uint32_t(c);
+    auto it = houseMap().find(v & 0xffffffU);
+    return it == houseMap().end() ? c : Color{(v & 0xff000000U) | it->second};
+}
+auto houseUnthemed(Color c) -> Color {
+    auto v = uint32_t(c);
+    for (auto const& [house, themed]: houseMap()) {
+        if (themed == (v & 0xffffffU)) {
+            return Color{(v & 0xff000000U) | house};
+        }
+    }
+    return c;
+}
+}  // namespace
+
+// MainWindow.cpp calls this when the house map changes, so a theme switch applies while the app runs.
+void reloadHouseMapColours() { houseMapMut() = loadHouseMap(); }
 
 Settings::Settings(fs::path filepath): filepath(std::move(filepath)) { loadDefault(); }
 
@@ -110,8 +166,8 @@ void Settings::loadDefault() {
 
     this->stylusCursorType = STYLUS_CURSOR_DOT;
     this->eraserVisibility = ERASER_VISIBILITY_ALWAYS;
-    this->iconTheme = ICON_THEME_COLOR;
-    this->themeVariant = THEME_VARIANT_USE_SYSTEM;
+    this->iconTheme = ICON_THEME_LUCIDE;          // X0urnal++: line icons, tinted bone at build time
+    this->themeVariant = THEME_VARIANT_FORCE_DARK;  // X0urnal++: dark is the default, not an option
     this->highlightPosition = false;
     this->cursorHighlightColor = 0x80FFFF00;  // Yellow with 50% opacity
     this->cursorHighlightRadius = 30.0;
@@ -192,16 +248,17 @@ void Settings::loadDefault() {
     this->preloadPagesAfter = 5U;
     this->eagerPageCleanup = true;
 
-    this->selectionBorderColor = Colors::red;
-    this->selectionMarkerColor = Colors::xopp_cornflowerblue;
-    this->activeSelectionColor = Colors::lawngreen;
+    // X0urnal++: one accent for the live thing -- spectral #62e670; the active search hit is orchid #bb9bf7.
+    this->selectionBorderColor = Color{0xff62e670U};
+    this->selectionMarkerColor = Color{0xff62e670U};
+    this->activeSelectionColor = Color{0xffbb9bf7U};
 
     this->recolorParameters = {false, false, Recolor(ColorU8{198, 208, 245}, ColorU8{48, 52, 70})};
 
-    this->backgroundColor = Colors::xopp_gainsboro02;
+    this->backgroundColor = Color{0xff05070aU};  // X0urnal++: the canvas ground is the void
 
     // clang-format off
-	this->pageTemplate = "xoj/template\ncopyLastPageSettings=true\nsize=595.275591x841.889764\nbackgroundType=lined\nbackgroundColor=#ffffff\n";
+	this->pageTemplate = "xoj/template\ncopyLastPageSettings=true\nsize=595.275591x841.889764\nbackgroundType=graph\nbackgroundColor=#05070a\n";  // X0urnal++: black graph paper (the void), like OneNote's dark mode
     // clang-format on
 
 #ifdef ENABLE_AUDIO
@@ -2151,9 +2208,10 @@ void Settings::setEagerPageCleanup(bool b) {
     save();
 }
 
-auto Settings::getBorderColor() const -> Color { return this->selectionBorderColor; }
+auto Settings::getBorderColor() const -> Color { return houseThemed(this->selectionBorderColor); }
 
 void Settings::setBorderColor(Color color) {
+    color = houseUnthemed(color);  // X0urnal++: settings.xml keeps the house colour
     if (this->selectionBorderColor == color) {
         return;
     }
@@ -2161,9 +2219,10 @@ void Settings::setBorderColor(Color color) {
     save();
 }
 
-auto Settings::getSelectionColor() const -> Color { return this->selectionMarkerColor; }
+auto Settings::getSelectionColor() const -> Color { return houseThemed(this->selectionMarkerColor); }
 
 void Settings::setSelectionColor(Color color) {
+    color = houseUnthemed(color);  // X0urnal++: settings.xml keeps the house colour
     if (this->selectionMarkerColor == color) {
         return;
     }
@@ -2171,9 +2230,10 @@ void Settings::setSelectionColor(Color color) {
     save();
 }
 
-auto Settings::getActiveSelectionColor() const -> Color { return this->activeSelectionColor; }
+auto Settings::getActiveSelectionColor() const -> Color { return houseThemed(this->activeSelectionColor); }
 
 void Settings::setActiveSelectionColor(Color color) {
+    color = houseUnthemed(color);  // X0urnal++: settings.xml keeps the house colour
     if (this->activeSelectionColor == color) {
         return;
     }
@@ -2191,9 +2251,10 @@ void Settings::setRecolorParameters(RecolorParameters&& recolor) {
     save();
 }
 
-auto Settings::getBackgroundColor() const -> Color { return this->backgroundColor; }
+auto Settings::getBackgroundColor() const -> Color { return houseThemed(this->backgroundColor); }
 
 void Settings::setBackgroundColor(Color color) {
+    color = houseUnthemed(color);  // X0urnal++: settings.xml keeps the house colour
     if (this->backgroundColor == color) {
         return;
     }

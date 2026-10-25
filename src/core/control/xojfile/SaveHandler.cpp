@@ -222,6 +222,16 @@ void SaveHandler::visitPage(XmlNode* root, ConstPageRef p, const Document* doc, 
     page->setAttrib("width", p->getWidth());
     page->setAttrib("height", p->getHeight());
 
+    /*
+     * X0urnal++: an infinite-canvas (notebook) page. Written only when true, so
+     * an ordinary document's file is byte-identical to what upstream produces.
+     * Appended after width/height because attribute order matters here -- see
+     * the note on PDF backgrounds below.
+     */
+    if (p->isInfiniteCanvas()) {
+        page->setAttrib("infinite", "true");
+    }
+
     auto* background = new XmlNode("background");
     page->addChild(background);
 

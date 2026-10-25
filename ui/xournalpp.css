@@ -1,215 +1,430 @@
 /*
- * Backup before modifying
+ * X0urnal++ -- the house palette over GTK's built-in Adwaita (dark variant; MainWindow.cpp pins
+ * the root theme name so the dark variant actually resolves).
  *
+ * MainWindow::loadMainCSS loads this file at GTK_STYLE_PROVIDER_PRIORITY_APPLICATION, which sits
+ * ABOVE the theme in GTK3's cascade: any property a rule here sets beats Adwaita's rule for the
+ * same node, whatever the specificity. So these are plain node selectors, nothing clever.
+ * Debug with:  GTK_DEBUG=interactive /opt/X0urnal++/bin/xournalpp
  *
- *  Try running Xournal++ like this:    GTK_DEBUG=interactive  xournalpp
- *
- *  See: https://wiki.gnome.org/action/show/Projects/GTK/Inspector
+ * Palette:
+ *   void #05070a (ground)  crypt #0a0e14  crypt-hi #111823  stone #1a2430 / #26333f (rules, frames)
+ *   bone #d8d4c4 (text)  bone-dim #8b8778  ash #5c6470
+ *   spectral #62e670 (THE accent, the one live thing)  viscera #b8453a (danger)  gold #d4a843 (highlighter, warn)
+ *   orchid #bb9bf7 (the second accent: search hits, selection chrome)
+ * Every colour here can be re-mapped at run time by the house map (MainWindow::loadMainCSS).
+ * Style: a terminal, not a dialog. 1px rules, no gradients, no rounded corners, no shadows, square.
+ * The "Win98 chrome" section at the END adds dark Win98 bevels on top of that -- styling only
+ * (colours, edges, one titlebar gradient); no layout, no behaviour.
  */
 
-#pdfFloatingToolGrid {
-    padding: 7px;
-}
+@define-color void     #05070a;
+@define-color crypt    #0a0e14;
+@define-color crypt_hi #111823;
+@define-color stone    #1a2430;
+@define-color stone_hi #26333f;
+@define-color bone     #d8d4c4;
+@define-color bone_dim #8b8778;
+@define-color ash      #5c6470;
+@define-color spectral #62e670;
+@define-color viscera  #b8453a;
+@define-color gold     #d4a843;   /* the highlighter pen and warn: a highlighter that is not yellow is not a highlighter */
+@define-color orchid   #bb9bf7;   /* the second accent: active search hit, selection chrome */
 
-/*Style the Floating Toolbox!*/
-#floatingToolbox > box,
-#pdfFloatingToolGrid {
-	background-color: white;
-	border-radius: 12px;
+/* Adwaita's exported names, for the few widgets that reference them at runtime. */
+@define-color theme_bg_color @void;
+@define-color theme_fg_color @bone;
+@define-color theme_base_color @crypt;
+@define-color theme_text_color @bone;
+@define-color theme_selected_bg_color @spectral;
+@define-color theme_selected_fg_color @void;
+@define-color borders @stone_hi;
+@define-color unfocused_borders @stone;
+@define-color warning_color @gold;
+@define-color error_color @viscera;
+@define-color success_color @spectral;
 
-	box-shadow: 0px 0px 3px rgba(0, 0, 0, 0.4);
-
-	/* Add a margin. If we don't have this, Gtk clips the shadow!  */
-	margin: 7px;
-}
-
-#floatingToolbox box toolbar {
-	background-color: rgba(255, 255, 255, 0);
-}
-
-#floatingToolbox button {
-	background-color: rgba(255, 255, 255, 0.8);
-	border-radius: 12px;
-}
-
-#pdfFloatingToolGrid button {
-	background: rgba(255, 255, 255, 0.8);
-	border: 12px;
-}
-
-#pdfFloatingToolGrid button:hover {
-	border-radius: 12px;
-	background: rgba(245, 245, 245, 0.8);
-	box-shadow: inset 0px 0px 2px gray;
-}
-
-/*
-	Use :checked for a selected ToggleButton.
-	See https://stackoverflow.com/questions/39824345/use-css-to-style-gtktogglebutton-depending-on-the-state
-*/
-#floatingToolbox button:checked {
-	/*background-color: lightblue;*/
-	border-color: lightblue;
-	box-shadow: inset 0px 0px 3px lightblue;
-
-	transition: background-color 0.5s ease, border-color 0.5s ease, margin 0.3s ease;
-}
-
-#floatingToolbox toolbar,
-#pdfFloatingToolGrid button {
-    /*
-      The Adaptia GTK theme adds box-shadows to toolbars.
-      Remove them to avoid horizontal lines that extend outside
-      the edge of the floating toolbox.
-     */
-
+/* ---- the one rule that makes it a terminal ------------------------------------------- */
+* {
+    font-family: "BigBlueTerm437 Nerd Font Mono";
+    font-size: 10pt;
+    border-radius: 0;
     box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    background-image: none;
+    outline-color: alpha(@spectral, 0.6);
+    outline-style: solid;
+    outline-width: 1px;
+    outline-offset: -3px;
 }
 
-window.darkMode #floatingToolbox button,
-window.darkMode #pdfFloatingToolGrid button {
-	background: rgba(55, 53, 53, 0.5);
-	border: none;
+/* ---- grounds -------------------------------------------------------------------------- */
+window, .background, dialog, viewport, scrolledwindow, paned, overlay, box, grid, stack {
+    background-color: @void;
+    color: @bone;
 }
+label { color: @bone; }
+label:disabled, .dim-label { color: @bone_dim; opacity: 1; }
 
-window.darkMode #floatingToolbox button:checked {
-	background: rgba(85, 85, 95, 0.1);
-	border-color: lightblue;
-	box-shadow: 0px 0px 3px lightblue;
+/* Chrome (menubar, toolbars, sidebar, statusbar) sits one step up from the void, in the crypt,
+   and is divided from the canvas by a single stone rule. */
+menubar, toolbar, #sidebar, #statusbar, headerbar, .titlebar, notebook > header {
+    background-color: @crypt;
+    color: @bone;
 }
+menubar   { border-bottom: 1px solid @stone_hi; padding: 0; }
+#tbTop1, #tbTop2       { border-bottom: 1px solid @stone_hi; }
+#tbBottom1, #tbBottom2 { border-top:    1px solid @stone_hi; }
+#tbLeft1, #tbLeft2     { border-right:  1px solid @stone_hi; }
+#tbRight1, #tbRight2   { border-left:   1px solid @stone_hi; }
+#sidebar   { border-right: 1px solid @stone_hi; }
+#statusbar { border-top:   1px solid @stone_hi; padding: 2px 6px; }
+headerbar, .titlebar { border-bottom: 1px solid @stone_hi; min-height: 28px; padding: 0 6px; }
+headerbar .title { color: @bone; font-weight: normal; }
 
-window.darkMode #floatingToolbox > box,
-window.darkMode #pdfFloatingToolGrid  {
-	background-color: black;
-
-	/*
-	  Lighter gray shadow for better contrast on dark
-	  backgrounds.
-	*/
-	box-shadow: 0px 0px 5px rgba(90, 90, 90, 0.7);
+/* Client-side decorations, if GTK draws any: a 1px stone frame, no shadow halo. */
+decoration {
+    border: 1px solid @stone_hi;
+    box-shadow: none;
+    margin: 0;
 }
+decoration:backdrop { border-color: @stone; }
 
-/* Add additional padding and a border to make editing toolbars easier. */
-toolbar.editing {
-	padding-top: 4px;
-	padding-bottom: 4px;
-
-	border: 4px dashed orange;
-	border-radius: 3px;
-
-	box-shadow: inset -2px -2px 8px orange;
+/* ---- menus & popovers ---------------------------------------------------------------- */
+menubar > menuitem { padding: 4px 10px; color: @bone; }
+menubar > menuitem:hover { background-color: @stone; color: @spectral; }
+menu, .menu, .context-menu {
+    background-color: @crypt;
+    color: @bone;
+    border: 1px solid @stone_hi;
+    padding: 2px 0;
 }
-
-/*Fix ugly Background drop down button
- *
- * We need to select the button beside two labels or we will affect
- * the pen tool when in FloatingToolbox (and can't see activation highlight).
- *
- * Ideally we will give name properties to all of the widgets created in
- * code as well as specifying names in glade files.
- *
- * Note: in glade files, property with name="name". i.e. <property name="name">floatingToolbox</property>
- */
-
-
-toolitem > box > label+label+button
-{
-	border-width:0;
-	box-shadow:none;
-	background-image:none;
+menu menuitem { padding: 4px 10px; color: @bone; }
+menu menuitem:hover { background-color: @stone; color: @spectral; }
+menu menuitem:disabled { color: @ash; }
+menu menuitem accelerator { color: @bone_dim; }
+menu separator { background-color: @stone_hi; min-height: 1px; margin: 2px 0; }
+popover.background, popover.background.csd {
+    background-color: @crypt;
+    color: @bone;
+    border: 1px solid @stone_hi;
+    padding: 4px;
 }
-
-toolbar button,
-popover.toolbar button {
-  padding:3px;
+popover.background > contents, popover.background > stack, popover.background > box { background-color: @crypt; }
+tooltip, tooltip.background, tooltip * {
+    background-color: @crypt;
+    color: @bone;
 }
+tooltip { border: 1px solid @stone_hi; padding: 4px; }
 
-.orientationFormatBox > button > widget > box > image {
-	margin-left: 3px;
-	margin-right: 3px;
+/* ---- buttons -------------------------------------------------------------------------- */
+button {
+    background-color: transparent;
+    color: @bone;
+    border: 1px solid @stone;
+    padding: 3px;
 }
+button:hover  { border-color: @spectral; color: @bone; background-color: @crypt_hi; }
+button:active, button:checked { background-color: @stone; border-color: @spectral; color: @spectral; }
+button:disabled { color: @ash; border-color: @stone; background-color: transparent; }
+button.destructive-action { color: @viscera; border-color: @viscera; }
+button.suggested-action   { color: @spectral; border-color: @spectral; }
+button.default { border-color: @spectral; }
+button image { color: inherit; }
+button:disabled image { opacity: 0.4; }
 
+/* Toolbar buttons are flat until they are the live one (upstream did the same, in grey). */
+toolbar button, popover.toolbar button { padding: 3px; }
 toolbar button:not(:checked):not(:active):not(:hover),
-popover.toolbar button:not(:checked):not(:active):not(:hover){
-  border-color:transparent;
-  box-shadow:none;
-  background-color:transparent;
-  background-image:none;
+popover.toolbar button:not(:checked):not(:active):not(:hover) {
+    border-color: transparent;
+    background-color: transparent;
+}
+toolitem > box > label+label+button { border-width: 0; }
+
+/* ---- fields --------------------------------------------------------------------------- */
+entry, spinbutton, textview, textview text, .view, treeview.view, list, row, iconview {
+    background-color: @crypt;
+    color: @bone;
+    border: 1px solid @stone;
+    caret-color: @spectral;
+}
+entry:focus, spinbutton:focus, textview:focus { border-color: @spectral; }
+entry:disabled, spinbutton:disabled { color: @ash; }
+spinbutton button { border: none; border-left: 1px solid @stone; }
+combobox button { border: 1px solid @stone; }
+combobox arrow, button arrow, expander arrow { color: @bone_dim; -gtk-icon-shadow: none; }
+selection, entry selection, textview selection, *:selected { background-color: @spectral; color: @void; }
+treeview.view:selected, treeview.view:selected:focus, row:selected, row:selected:focus {
+    background-color: @stone;
+    color: @spectral;
+}
+treeview.view header button {
+    background-color: @crypt;
+    border: none;
+    border-bottom: 1px solid @stone_hi;
+    border-right: 1px solid @stone_hi;
+    color: @bone_dim;
+}
+treeview.view:hover, row:hover { background-color: @crypt_hi; }
+frame > border, .frame { border: 1px solid @stone_hi; }
+
+check, radio {
+    background-color: @crypt;
+    color: @spectral;
+    border: 1px solid @stone_hi;
+    min-width: 12px; min-height: 12px;
+}
+check:checked, radio:checked, check:hover, radio:hover { border-color: @spectral; }
+check:disabled, radio:disabled { color: @ash; border-color: @stone; }
+radiobutton.invisible radio { color: transparent; background-color: transparent; border-style: none; }
+
+switch { background-color: @crypt; border: 1px solid @stone_hi; color: @bone_dim; }
+switch:checked { border-color: @spectral; color: @spectral; }
+switch slider { background-color: @bone_dim; border: none; min-width: 16px; min-height: 16px; margin: 1px; }
+switch:checked slider { background-color: @spectral; }
+
+scale trough { background-color: @stone; border: none; min-height: 3px; }
+scale highlight { background-color: @spectral; border: none; }
+scale slider { background-color: @bone; border: 1px solid @stone_hi; min-width: 10px; min-height: 10px; margin: -4px; }
+scale slider:hover { border-color: @spectral; }
+scale marks, scale value { color: @bone_dim; }
+
+progressbar trough { background-color: @stone; border: none; min-height: 3px; }
+progressbar progress { background-color: @spectral; border: none; min-height: 3px; }
+levelbar block { background-color: @stone; border: 1px solid @stone_hi; }
+levelbar block.filled { background-color: @spectral; }
+
+/* ---- structure ------------------------------------------------------------------------ */
+separator { background-color: @stone_hi; min-width: 1px; min-height: 1px; }
+separator.spacer { background-color: transparent; }
+paned > separator { background-color: @stone_hi; min-width: 1px; min-height: 1px; }
+paned > separator:hover { background-color: @spectral; }
+
+scrollbar { background-color: @crypt; border: none; }
+scrollbar.horizontal { border-top: 1px solid @stone; }
+scrollbar.vertical   { border-left: 1px solid @stone; }
+scrollbar trough { background-color: transparent; border: none; }
+scrollbar slider {
+    background-color: @stone_hi;
+    border: 2px solid @crypt;
+    min-width: 8px; min-height: 8px;
+    margin: 0;
+}
+scrollbar slider:hover { background-color: @bone_dim; }
+scrollbar slider:active { background-color: @spectral; }
+scrollbar.overlay-indicator:not(.dragging):not(.hovering) slider { background-color: @stone_hi; }
+
+notebook > header { border-bottom: 1px solid @stone_hi; padding: 0; }
+notebook > header > tabs > tab { color: @bone_dim; padding: 4px 10px; border: none; margin: 0; }
+notebook > header > tabs > tab:hover { color: @bone; }
+notebook > header > tabs > tab:checked { color: @spectral; border-bottom: 1px solid @spectral; }
+notebook > stack { background-color: @void; border: none; }
+notebook frame > label { color: @bone_dim; font-weight: bold; }
+
+expander title:hover > arrow { color: @spectral; }
+infobar, infobar > revealer > box { background-color: @crypt; border: 1px solid @stone_hi; color: @bone; }
+infobar.warning > revealer > box { border-color: @gold; }
+infobar.error > revealer > box   { border-color: @viscera; }
+
+/* ---- Xournal++'s own named widgets ---------------------------------------------------- */
+/* The floating toolbox (assigned to a stylus button) and the PDF text-selection toolbox. Upstream
+   drew these white, rounded and shadowed; here they are a crypt panel with a 1px stone rule. */
+#pdfFloatingToolGrid { padding: 4px; }
+#floatingToolbox > box, #pdfFloatingToolGrid {
+    background-color: @crypt;
+    border: 1px solid @stone_hi;
+    margin: 4px;
+}
+#floatingToolbox box toolbar { background-color: transparent; }
+#floatingToolbox button, #pdfFloatingToolGrid button { background-color: transparent; border: 1px solid transparent; }
+#floatingToolbox button:hover, #pdfFloatingToolGrid button:hover { border-color: @spectral; }
+#floatingToolbox button:checked { border-color: @spectral; color: @spectral; background-color: @stone; }
+
+/* Toolbar customisation mode: a dashed rule marks the editable toolbars ("look here" -- chrome,
+   not a warning, so it wears the second accent rather than the warn gold). */
+toolbar.editing {
+    padding-top: 4px;
+    padding-bottom: 4px;
+    border: 1px dashed @orchid;
 }
 
-radiobutton.invisible radio {
-  color:transparent;
-  background-color:transparent;
-  background-image:none;
-  outline-style:none;
-  border-style:none;
-  box-shadow:none;
-}
+/* Search bar mismatch is signalled by SearchBar.cpp with its own provider (red text); leave it. */
+#searchBar { background-color: @crypt; border-top: 1px solid @stone_hi; }
 
-/* A spacer is a transparent separator with expand == true */
-separator.spacer {
-  color:transparent;
-  background-color:transparent;
-  background-image:none;
-  outline-style:none;
-  border-style:none;
-  box-shadow:none;
-}
+.orientationFormatBox > button > widget > box > image { margin-left: 3px; margin-right: 3px; }
 
-/*  If you want to change the size of toolbar buttons try these:
-*   All toolbars:
-*/
+menubar, toolbar { -GtkWidget-window-dragging: false; }
 
-/*
-toolbar button
-{
-	padding: 2
-}
-*/
-
-
-
-/* Or for individual toolbars: tbLeft1 tbLeft2 tbTop1 tbTop2 tbBottom1 tbFloat4 etc:
- */
-
-/*
-#tbLeft2 button
-{
-	padding: 2
-}
-*/
-
-
-/*
-Labels for subsections of the Settings dialog
-*/
-notebook frame>label {
-    color: #666;
-    font-weight: bold;
-}
-
-menubar, toolbar {
-    -GtkWidget-window-dragging: false
-}
-
+/* Settings > input devices: button and touch indicators. Square, stone; pressed = viscera. */
 label.setting-button-indicator {
-    border: 1px solid gray;
-    border-radius: 3px;
+    border: 1px solid @stone_hi;
     margin: 1px;
     padding: 2px;
 }
-
-label.setting-button-indicator.pressed {
-    background-color: red;
-}
-
+label.setting-button-indicator.pressed { background-color: @viscera; color: @void; }
 label.setting-touch-indicator {
-    border: none;
-    background: radial-gradient(circle at center, alpha(gray,.7) 0%, alpha(gray,.7) 20%, alpha(gray, .1) 60%, alpha(gray, 0.) 100%);
-    border-radius: 50%;
+    border: 1px solid @stone_hi;
+    background-color: @stone;
     margin: 1px;
     padding: 10px;
 }
-label.setting-touch-indicator.pressed {
-    background: radial-gradient(circle at center, red 0%, red 20%, alpha(red, .1) 60%, alpha(red, 0.) 100%);
+label.setting-touch-indicator.pressed { background-color: @viscera; }
+
+/* ==== Win98 chrome =========================================================================
+ * Win98 styling over the flat theme: edges and fills only, no layout and no behaviour. Delete
+ * this section and the file is exactly the flat terminal above.
+ *
+ * The bevel is 98.css's: four stacked INSET box-shadows, a 1px outer ring and a 1px inner ring,
+ * light top-left and dark bottom-right (raised), swapped (sunken). The four tones are a DARK
+ * Win98 set built from the palette above, not 98.css's silver. Zero rounding stays (the `*` rule
+ * above).
+ * No Win98 hover: where the flat style lit an edge spectral on hover, the edge now rises instead,
+ * and spectral stays on the text -- the one live thing.
+ */
+@define-color bevel_white  #26333f;   /* outer top-left     (= stone_hi) */
+@define-color bevel_light  #1a2430;   /* inner top-left     (= stone)    */
+@define-color bevel_shadow #070b10;   /* inner bottom-right              */
+@define-color bevel_dark   #000000;   /* outer bottom-right, true black  */
+
+/* Raised panels: menus, popovers, tooltips, the floating toolboxes, window decoration. */
+menu, .menu, .context-menu, popover.background, tooltip,
+#floatingToolbox > box, #pdfFloatingToolGrid, decoration {
+    border: none;
+    padding: 3px;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white,
+                inset -2px -2px @bevel_shadow, inset 2px 2px @bevel_light;
+}
+decoration { padding: 0; }
+
+/* Push buttons: a raised face one step above the chrome; pressed/checked sinks. */
+button {
+    background-color: @crypt_hi;
+    border: none;
+    padding: 4px 6px;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white,
+                inset -2px -2px @bevel_shadow, inset 2px 2px @bevel_light;
+}
+button:hover { background-color: @crypt_hi; color: @spectral; }
+button:active, button:checked {
+    background-color: @stone;
+    color: @spectral;
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark,
+                inset -2px -2px @bevel_light, inset 2px 2px @bevel_shadow;
+}
+button:disabled { background-color: @crypt_hi; color: @ash; }
+button.default, button.suggested-action { color: @spectral; }
+button.destructive-action { color: @viscera; }
+
+/* Toolbar buttons: Win98's flat "coolbar" -- nothing until hover, then a thin 1px raise;
+   the live tool (checked) and a press sit in a thin sunken well. */
+toolbar button, popover.toolbar button,
+#floatingToolbox button, #pdfFloatingToolGrid button,
+spinbutton button, headerbar button {
+    background-color: transparent;
+    border: none;
+    padding: 3px;
+    box-shadow: none;
+}
+toolbar button:hover, popover.toolbar button:hover,
+#floatingToolbox button:hover, #pdfFloatingToolGrid button:hover,
+spinbutton button:hover, headerbar button:hover {
+    background-color: transparent;
+    color: @spectral;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white;
+}
+toolbar button:checked, toolbar button:active,
+popover.toolbar button:checked, popover.toolbar button:active,
+#floatingToolbox button:checked, #floatingToolbox button:active,
+spinbutton button:active, headerbar button:active {
+    background-color: @stone;
+    color: @spectral;
+    /* sunken, with spectral as the lit bottom-right edge: the house tones alone are too close to
+       the crypt to read, and the flat style's spectral frame is the "this tool is live" signal;
+       a plain dark well makes the active pen disappear. */
+    box-shadow: inset -1px -1px @spectral, inset 1px 1px @bevel_dark, inset 2px 2px @bevel_shadow;
+}
+
+/* The menubar: items rise on hover, sink while their menu is open. */
+menubar > menuitem:hover {
+    background-color: transparent;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white;
+}
+menubar > menuitem:hover:active, menubar > menuitem:selected {
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark;
+}
+
+/* Chrome bars: a thin raised edge instead of the flat stone rule. */
+menubar, toolbar, #sidebar {
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white;
+}
+#tbTop1, #tbTop2, #tbBottom1, #tbBottom2, #tbLeft1, #tbLeft2, #tbRight1, #tbRight2, menubar, #sidebar {
+    border: none;
+}
+/* The statusbar is a sunken well, as in every Win98 app. */
+#statusbar {
+    border: none;
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark;
+}
+
+/* Title bar: the Win98 caption gradient in the palette's own tones (crypt -> stone) instead
+   of navy -> blue. The one gradient in the file. */
+headerbar, .titlebar {
+    background-image: linear-gradient(to right, @crypt, @stone);
+    border-bottom: none;
+}
+headerbar:backdrop, .titlebar:backdrop { background-image: none; background-color: @crypt; }
+
+/* Fields: sunken double wells; focus keeps the spectral outline from the `*` rule. */
+entry, spinbutton, combobox button {
+    border: none;
+    padding: 3px 5px;
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark,
+                inset -2px -2px @bevel_light, inset 2px 2px @bevel_shadow;
+}
+entry:focus, spinbutton:focus { box-shadow: inset -1px -1px @spectral, inset 1px 1px @bevel_dark,
+                inset -2px -2px @bevel_light, inset 2px 2px @bevel_shadow; }
+check, radio {
+    border: none;
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark;
+}
+check:checked, radio:checked, check:hover, radio:hover {
+    box-shadow: inset -1px -1px @spectral, inset 1px 1px @bevel_dark;
+}
+frame > border, .frame {
+    border: none;
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark;
+}
+
+/* Scrollbars: the thumb is a raised block; the trough stays the plain crypt. */
+scrollbar slider {
+    background-color: @crypt_hi;
+    border: none;
+    min-width: 12px; min-height: 12px;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white,
+                inset -2px -2px @bevel_shadow, inset 2px 2px @bevel_light;
+}
+scrollbar slider:hover  { background-color: @stone; }
+scrollbar slider:active { background-color: @stone; box-shadow: inset -1px -1px @spectral, inset 1px 1px @spectral; }
+scrollbar.overlay-indicator:not(.dragging):not(.hovering) slider { background-color: @crypt_hi; }
+
+/* Sliders and meters. */
+scale slider {
+    background-color: @crypt_hi;
+    border: none;
+    box-shadow: inset -1px -1px @bevel_dark, inset 1px 1px @bevel_white;
+}
+scale slider:hover { background-color: @stone; }
+scale trough, progressbar trough {
+    box-shadow: inset -1px -1px @bevel_white, inset 1px 1px @bevel_dark;
+    min-height: 4px;
+}
+
+/* Tabs: the live tab is a raised tab (top/left/right edges), the rest lie flat. */
+notebook > header > tabs > tab:checked {
+    background-color: @crypt_hi;
+    border-bottom: none;
+    box-shadow: inset 1px 1px @bevel_white, inset -1px 0 @bevel_dark,
+                inset 2px 2px @bevel_light, inset -2px 0 @bevel_shadow;
 }

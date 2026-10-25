@@ -322,6 +322,13 @@ void LoadHandler::parseContents() {
 
         this->page = std::make_unique<XojPage>(width, height, /*suppressLayer*/ true);
 
+        /* X0urnal++: optional, so a stock .xopp simply has no opinion and the
+           page stays an ordinary bounded one. */
+        const char* infinite = LoadHandlerHelper::getAttrib("infinite", true, this);
+        if (infinite != nullptr && strcmp(infinite, "true") == 0) {
+            this->page->setInfiniteCanvas(true);
+        }
+
         pages.push_back(this->page);
     } else if (strcmp(elementName, "audio") == 0) {
         this->parseAudio();

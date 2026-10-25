@@ -150,11 +150,22 @@ void SidebarPreviewBaseEntry::updateSize() {
     this->DPIscaling = gtk_widget_get_scale_factor(this->button.get());
 
     const int shadowPadding = Shadow::getShadowBottomRightSize() + Shadow::getShadowTopLeftSize() + 4;
+
+    /*
+     * X0urnal++: an infinite canvas is previewed by its CONTENT, not its page
+     * rectangle -- that rectangle is just however far the canvas has grown, so
+     * the thumbnail would be a vast empty box with the ink a few pixels wide.
+     * PreviewJob::initGraphics scales to the same box; the two must agree.
+     */
+    const auto box = page->isInfiniteCanvas() ?
+                             page->contentBounds() :
+                             xoj::util::Rectangle<double>{0.0, 0.0, page->getWidth(), page->getHeight()};
+
     // To avoid having a black line, we use floor rather than ceil
     this->imageWidth =
-            std::min(floor_cast<int>(page->getWidth() * sidebar->getZoom()) + shadowPadding, MAX_MINIATURE_SIZE);
+            std::min(floor_cast<int>(box.width * sidebar->getZoom()) + shadowPadding, MAX_MINIATURE_SIZE);
     this->imageHeight =
-            std::min(floor_cast<int>(page->getHeight() * sidebar->getZoom()) + shadowPadding, MAX_MINIATURE_SIZE);
+            std::min(floor_cast<int>(box.height * sidebar->getZoom()) + shadowPadding, MAX_MINIATURE_SIZE);
     gtk_widget_set_size_request(this->button.get(), imageWidth, imageHeight);
 }
 

@@ -31,7 +31,8 @@ protected:
     double lineSpacing = 24.0;  // Between two horizontal lines
 
     constexpr static Color DEFAULT_H_LINE_COLOR = Colors::xopp_dodgerblue;
-    constexpr static Color ALT_DEFAULT_H_LINE_COLOR = Colors::xopp_darkslategray;
+    constexpr static Color ALT_DEFAULT_H_LINE_COLOR = Color{0xff2d4f7aU};  // X0urnal++: blue rules on
+    // black paper, matching the graph/dotted grid so every paper style reads as one set
     constexpr static double DEFAULT_LINE_WIDTH = 0.5;
 
     constexpr static double HEADER_SIZE = 80.0;

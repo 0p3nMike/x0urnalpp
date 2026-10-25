@@ -22,6 +22,7 @@
 #include "util/safe_casts.h"            // for strict_cast, as_signed, as_si...
 #include "view/DocumentView.h"          // for DocumentView
 #include "view/Mask.h"                  // for Mask
+#include "view/ViewportBuffer.h"        // X0urnal++: for ViewportBuffer
 
 #if defined(__has_cpp_attribute) && __has_cpp_attribute(likely)
 #define XOJ_CPP20_UNLIKELY [[unlikely]]
@@ -46,6 +47,19 @@ void RenderJob::rerenderRectangle(Rectangle<double> const& rect) {
 
     Range maskRange(rect);
     maskRange.addPadding(RENDER_PADDING);
+
+    /*
+     * X0urnal++: with a partial buffer, a dirty rectangle outside the resident
+     * region must be dropped rather than painted. Mask::paintTo positions by
+     * offset, so an off-surface blit silently does nothing and the region would
+     * then be WRONG when it scrolled into view.
+     */
+    if (view->residentRange.isValid() && !view->residentRange.empty()) {
+        maskRange = maskRange.intersect(view->residentRange);
+        if (!maskRange.isValid() || maskRange.empty()) {
+            return;
+        }
+    }
     xoj::view::Mask newMask(view->xournal->getDpiScaleFactor(), maskRange, view->xournal->getZoom(),
                             CAIRO_CONTENT_COLOR_ALPHA);
 
@@ -70,8 +84,18 @@ void RenderJob::run() {
     this->view->repaintRectMutex.unlock();
 
     if (rerenderComplete) {
-        xoj::view::Mask newMask(view->xournal->getDpiScaleFactor(),
-                                Range(0, 0, view->page->getWidth(), view->page->getHeight()), view->xournal->getZoom(),
+        /*
+         * X0urnal++: render only what is visible (plus a margin) for an
+         * infinite-canvas page. For every other page this returns the whole
+         * page rect, i.e. exactly what was hardcoded here before.
+         *
+         * Measured before this change: a 150x150 cm page allocated 69 MB against
+         * an A4 page's 1.9 MB, and the growth is quadratic in page size.
+         */
+        const Range resident = xoj::view::ViewportBuffer::residentRange(
+                *view->page, view->getVisiblePart(), view->xournal->getZoom(), view->xournal->getDpiScaleFactor());
+        view->residentRange = resident;
+        xoj::view::Mask newMask(view->xournal->getDpiScaleFactor(), resident, view->xournal->getZoom(),
                                 CAIRO_CONTENT_COLOR_ALPHA);
 
         renderToBuffer(newMask.get());

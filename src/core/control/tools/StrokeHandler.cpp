@@ -26,6 +26,7 @@
 #include "model/Stroke.h"                                   // for Stroke, STROKE_...
 #include "model/XojPage.h"                                  // for XojPage
 #include "undo/InsertUndoAction.h"                          // for InsertUndoAction
+#include "undo/PageSizeChangeUndoAction.h"                  // X0urnal++
 #include "undo/RecognizerUndoAction.h"                      // for RecognizerUndoA...
 #include "undo/UndoRedoHandler.h"                           // for UndoRedoHandler
 #include "util/Assert.h"                                    // for xoj_assert
@@ -170,6 +171,46 @@ void StrokeHandler::onButtonReleaseEvent(const PositionInputData& pos, double zo
 
     UndoRedoHandler* undo = control->getUndoRedoHandler();
     undo->addUndoAction(std::make_unique<InsertUndoAction>(page, layer, stroke.get()));
+
+    /*
+     * X0urnal++: an infinite-canvas page grows to stay ahead of the pen.
+     *
+     * Right and down only: growing up or left would need a page origin that
+     * may go negative, which nothing here supports. The trigger is generous, so
+     * the edge is not reached mid-stroke, and growth is undoable through the
+     * same action the Paper Format dialog uses.
+     */
+    if (page->isInfiniteCanvas()) {
+        /* boundingRect() is a Rectangle<double> (x, y, width, height), not a
+           Range -- the two are easy to confuse in this codebase. */
+        const auto extent = stroke->boundingRect();
+        const double w = page->getWidth();
+        const double h = page->getHeight();
+        /* Trigger well before the edge: a stroke ENDING near the boundary means
+           the next one probably crosses it. */
+        constexpr double TRIGGER = 0.75;  // fraction of the page
+        constexpr double GROW = 0.5;      // how much to add, as a fraction
+        double newW = w;
+        double newH = h;
+        if (extent.x + extent.width > w * TRIGGER) {
+            newW = w * (1.0 + GROW);
+        }
+        if (extent.y + extent.height > h * TRIGGER) {
+            newH = h * (1.0 + GROW);
+        }
+        if (newW > w || newH > h) {
+            auto* doc = control->getDocument();
+            doc->lock();
+            Document::setPageSize(page, newW, newH);
+            const size_t pageNo = doc->indexOf(page);
+            const size_t pageCount = doc->getPageCount();
+            doc->unlock();
+            undo->addUndoAction(std::make_unique<PageSizeChangeUndoAction>(page, w, h));
+            if (pageNo != npos && pageNo < pageCount) {
+                control->firePageSizeChanged(pageNo);
+            }
+        }
+    }
 
     Settings* settings = control->getSettings();
     if (settings->getEmptyLastPageAppend() == EmptyLastPageAppendType::OnDrawOfLastPage) {

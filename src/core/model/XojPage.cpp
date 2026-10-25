@@ -1,5 +1,7 @@
 #include "XojPage.h"
 
+#include "model/Element.h"  // X0urnal++: contentBounds
+
 #include <algorithm>  // for find, transform
 #include <iterator>   // for back_insert_iterator, back_inserter, begin
 #include <utility>    // for move
@@ -125,6 +127,55 @@ void XojPage::setSize(double width, double height) {
     this->width = width;
     this->height = height;
 }
+
+/*
+ * X0urnal++: the bounding box of every element, plus a margin, clipped to the page.
+ */
+auto XojPage::contentBounds(double margin) const -> xoj::util::Rectangle<double> {
+    bool any = false;
+    double minX = 0, minY = 0, maxX = 0, maxY = 0;
+    for (const Layer* l: this->layer) {
+        /* getElementsView(), not getElements(): this method is const and the
+           latter hands out a non-const reference. */
+        for (const Element* e: l->getElementsView()) {
+            const auto r = e->boundingRect();
+            if (!any) {
+                minX = r.x;
+                minY = r.y;
+                maxX = r.x + r.width;
+                maxY = r.y + r.height;
+                any = true;
+            } else {
+                minX = std::min(minX, r.x);
+                minY = std::min(minY, r.y);
+                maxX = std::max(maxX, r.x + r.width);
+                maxY = std::max(maxY, r.y + r.height);
+            }
+        }
+    }
+    if (!any) {
+        /* An empty canvas has no content box. Returning a zero-sized rectangle
+           would make the exporter produce a degenerate page, so the page itself
+           is the honest answer. */
+        return {0.0, 0.0, this->width, this->height};
+    }
+    minX = std::max(0.0, minX - margin);
+    minY = std::max(0.0, minY - margin);
+    maxX = std::min(this->width, maxX + margin);
+    maxY = std::min(this->height, maxY + margin);
+    return {minX, minY, maxX - minX, maxY - minY};
+}
+
+/*
+ * X0urnal++: a PDF-backed page is never an infinite canvas -- its size is the
+ * size of the PDF page and means something. Guarding here rather than at every
+ * call site means a notebook can hold PDF pages that behave as they always have.
+ */
+auto XojPage::isInfiniteCanvas() const -> bool {
+    return this->infiniteCanvas && !this->bgType.isPdfPage();
+}
+
+void XojPage::setInfiniteCanvas(bool infinite) { this->infiniteCanvas = infinite; }
 
 auto XojPage::getWidth() const -> double { return this->width; }
 

@@ -8,6 +8,7 @@
 
 #include "control/AudioController.h"
 #include "control/Control.h"
+#include "control/notebook/NotebookController.h"  // X0urnal++
 #include "control/ScrollHandler.h"
 #include "control/ToolEnums.h"
 #include "control/UndoRedoController.h"
@@ -554,6 +555,33 @@ struct ActionProperties<Action::PAPER_FORMAT> {
 template <>
 struct ActionProperties<Action::PAPER_BACKGROUND_COLOR> {
     static void callback(GSimpleAction*, GVariant*, Control* ctrl) { ctrl->changePageBackgroundColor(); }
+};
+
+/* X0urnal++: make the current page an infinite whiteboard, or put it back. */
+template <>
+struct ActionProperties<Action::TOGGLE_INFINITE_CANVAS> {
+    static void callback(GSimpleAction*, GVariant*, Control* ctrl) { ctrl->toggleInfiniteCanvas(); }
+};
+
+/* X0urnal++: notebooks. */
+template <>
+struct ActionProperties<Action::NOTEBOOK_NEW> {
+    static void callback(GSimpleAction*, GVariant*, Control* ctrl) { ctrl->getNotebookController()->askToCreate(); }
+};
+template <>
+struct ActionProperties<Action::NOTEBOOK_OPEN> {
+    static void callback(GSimpleAction*, GVariant*, Control* ctrl) { ctrl->getNotebookController()->askToOpen(); }
+};
+template <>
+struct ActionProperties<Action::NOTEBOOK_CLOSE> {
+    static void callback(GSimpleAction*, GVariant*, Control* ctrl) { ctrl->getNotebookController()->closeNotebook(); }
+};
+template <>
+struct ActionProperties<Action::NOTEBOOK_OPEN_PATH> {
+    using parameter_type = const char*;
+    static void callback(GSimpleAction*, GVariant* p, Control* ctrl) {
+        ctrl->getNotebookController()->openNotebook(fs::u8path(getGVariantValue<const char*>(p)));
+    }
 };
 
 

@@ -51,10 +51,14 @@ void GraphBackgroundView::draw(cairo_t* cr) const {
      *     (partially) visible
      *  2- Set clearance so no line is drawn in the margin or to close to the edge of the sheet
      */
+    /* X0urnal++: on an infinite canvas the ruling follows the clip rather than
+       stopping at the page edge. */
     auto [indexMinX, indexMaxX] =
-            getIndexBounds(minX - halfLineWidth, maxX + halfLineWidth, squareSize, clearance, pageWidth);
+            unbounded ? getIndexBoundsUnbounded(minX - halfLineWidth, maxX + halfLineWidth, squareSize)
+                      : getIndexBounds(minX - halfLineWidth, maxX + halfLineWidth, squareSize, clearance, pageWidth);
     auto [indexMinY, indexMaxY] =
-            getIndexBounds(minY - halfLineWidth, maxY + halfLineWidth, squareSize, clearance, pageHeight);
+            unbounded ? getIndexBoundsUnbounded(minY - halfLineWidth, maxY + halfLineWidth, squareSize)
+                      : getIndexBounds(minY - halfLineWidth, maxY + halfLineWidth, squareSize, clearance, pageHeight);
 
     if (roundUpMargin) {
         auto [pageIndexMinX, pageIndexMaxX] = getIndexBounds(margin - halfLineWidth, pageWidth - margin + halfLineWidth,

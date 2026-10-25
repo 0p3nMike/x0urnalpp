@@ -12,7 +12,7 @@ PageTemplateSettings::PageTemplateSettings():
         copyLastPageSize(false),
         pageWidth(595.275591),
         pageHeight(841.889764),
-        backgroundColor(Colors::white) {
+        backgroundColor(Color{0xff05070aU}) {  // X0urnal++: black paper is the template default too
     backgroundType.format = PageTypeFormat::Lined;
 }
 

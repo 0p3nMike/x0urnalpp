@@ -23,6 +23,7 @@
 #include "BackgroundImage.h"  // for BackgroundImage
 #include "Layer.h"            // for Layer, Layer::Index
 #include "PageHandler.h"      // for PageHandler
+#include "util/Rectangle.h"  // X0urnal++: contentBounds
 #include "PageType.h"         // for PageType
 
 class XojPage: public PageHandler {
@@ -54,6 +55,25 @@ public:
 
     double getWidth() const;
     double getHeight() const;
+
+    /**
+     * X0urnal++: the box that actually contains something, plus a margin.
+     *
+     * For exporting and previewing an infinite canvas, where the page rectangle
+     * says nothing useful about where the content is. Returns the whole page
+     * when the page is empty, so callers never get a degenerate size.
+     */
+    xoj::util::Rectangle<double> contentBounds(double margin = 20.0) const;
+
+    /**
+     * X0urnal++: whether this page is an infinite-canvas notebook page.
+     *
+     * When set, only the visible region (plus a margin) is rasterised instead
+     * of the whole page -- see view/ViewportBuffer.h. A PDF-backed page is
+     * never infinite: it has a fixed size that means something.
+     */
+    bool isInfiniteCanvas() const;
+    void setInfiniteCanvas(bool infinite);
 
     size_t getPdfPageNr() const;
 
@@ -94,6 +114,7 @@ private:
     /**
      * The size of the page
      */
+    bool infiniteCanvas = false;  // X0urnal++: see isInfiniteCanvas()
     double width = 0;
     double height = 0;
 

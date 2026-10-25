@@ -139,11 +139,24 @@ bool XojCairoPdfExport::endPdf() {
 void XojCairoPdfExport::exportPage(size_t page, bool exportPdfBackground) {
     PageRef p = doc->getPage(page);
 
-    cairo_pdf_surface_set_size(this->surface, p->getWidth(), p->getHeight());
+    /*
+     * X0urnal++: an infinite canvas exports at the size of what is drawn on it.
+     * The page rectangle of a whiteboard says nothing useful -- it is whatever
+     * the canvas happened to grow to. cairo_pdf_surface_set_size is already
+     * per-page, so this costs nothing structurally.
+     */
+    const auto box = p->isInfiniteCanvas() ? p->contentBounds() :
+                                             xoj::util::Rectangle<double>{0.0, 0.0, p->getWidth(), p->getHeight()};
+    cairo_pdf_surface_set_size(this->surface, box.width, box.height);
 
     DocumentView view;
 
     cairo_save(this->cr);
+
+    /* X0urnal++: put the content box at the origin of the exported page. */
+    if (p->isInfiniteCanvas() && (box.x != 0.0 || box.y != 0.0)) {
+        cairo_translate(this->cr, -box.x, -box.y);
+    }
 
     // For a better pdf quality, we use a dedicated pdf rendering
     if (exportPdfBackground && p->getBackgroundType().isPdfPage() && (exportBackground != EXPORT_BACKGROUND_NONE)) {

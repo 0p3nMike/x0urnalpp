@@ -202,22 +202,23 @@ static void gtk_xournal_realize(GtkWidget* widget) {
 
 static void gtk_xournal_draw_shadow(GtkXournal* xournal, cairo_t* cr, int left, int top, int width, int height,
                                     bool selected) {
+    // X0urnal++: no drop shadow (the house style is 1px rules, no shadows).
+    //
+    // The border is stone, the same colour as the chrome around the canvas, for
+    // EVERY page: the bright selection colour would draw a rectangle around the
+    // entire canvas of a single-page whiteboard, marking the only page there is.
+    // The selected page keeps a 2px rule, so the cue survives on a paged document.
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
+    Util::cairo_set_source_rgbi(cr, Color{0xff26333fU});  // stone, matching the frame
     if (selected) {
-        Shadow::drawShadow(cr, left - 2, top - 2, width + 4, height + 4);
-
-        Settings* settings = xournal->view->getControl()->getSettings();
-
-        // Draw border
-        Util::cairo_set_source_rgbi(cr, settings->getBorderColor());
         cairo_set_line_width(cr, 2.0);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_SQUARE);
-        cairo_set_line_join(cr, CAIRO_LINE_JOIN_MITER);
-
         cairo_rectangle(cr, left - 1, top - 1, width + 2, height + 2);
-        cairo_stroke(cr);
     } else {
-        Shadow::drawShadow(cr, left, top, width, height);
+        cairo_set_line_width(cr, 1.0);
+        cairo_rectangle(cr, left - 0.5, top - 0.5, width + 1, height + 1);
     }
+    cairo_stroke(cr);
 }
 
 void gtk_xournal_repaint_area(GtkWidget* widget, int x1, int y1, int x2, int y2) {

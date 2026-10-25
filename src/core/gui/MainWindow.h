@@ -180,6 +180,7 @@ private:
     ToolbarData* selectedToolbar = nullptr;
 
     std::unique_ptr<Menubar> menubar;
+    GtkWidget* touchMenubar = nullptr;  ///< X0urnal++: the menus as popovers (TouchMenubar.h)
 
     bool maximized = false;
     bool darkMode = false;

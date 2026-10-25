@@ -43,6 +43,9 @@ class GeometryToolController;
 class AudioController;
 class FullscreenHandler;
 class Sidebar;
+namespace x0urnal {
+class NotebookController;
+}  // X0urnal++
 class GladeSearchpath;
 class MetadataManager;
 class XournalppCursor;
@@ -206,6 +209,7 @@ public:
 
     void paperTemplate();
     void paperFormat();
+    void toggleInfiniteCanvas();  // X0urnal++
     void changePageBackgroundColor();
     void updateBackgroundSizeButton();
 
@@ -313,6 +317,9 @@ public:
     size_t getCurrentPageNo() const;
     XournalppCursor* getCursor() const;
     Sidebar* getSidebar() const;
+
+    /// X0urnal++: the open notebook, if any. Never null; ask isOpen().
+    x0urnal::NotebookController* getNotebookController() const;
     SearchBar* getSearchBar() const;
     AudioController* getAudioController() const;
     PageTypeHandler* getPageTypes() const;
@@ -490,6 +497,7 @@ private:
     Document* doc = nullptr;
 
     Sidebar* sidebar = nullptr;
+    std::unique_ptr<x0urnal::NotebookController> notebookController;  // X0urnal++
     SearchBar* searchBar = nullptr;
 
     ToolHandler* toolHandler;

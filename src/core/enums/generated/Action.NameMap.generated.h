@@ -64,6 +64,11 @@ constexpr const char* ACTION_NAMES[] = {  // Action to string conversion map
         "delete-page",
         "paper-format",
         "paper-background-color",
+        "toggle-infinite-canvas",  // X0urnal++
+        "notebook-new",      // X0urnal++
+        "notebook-open",     // X0urnal++
+        "notebook-close",    // X0urnal++
+        "notebook-open-path",  // X0urnal++
         "select-tool",
         "select-default-tool",
         "tool-draw-shape-recognizer",

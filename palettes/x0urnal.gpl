@@ -1,0 +1,15 @@
+GIMP Palette
+Name: X0urnal++
+# The X0urnal++ house palette as pen colours, for black paper. Bone is the ink; spectral is the
+# one accent; necrotic, teal, corpse and pale are the cool marks, gold and viscera the warm ones.
+216 212 196 Bone
+ 98 230 112 Spectral
+200 255 208 Pale
+212 168  67 Gold
+184  69  58 Viscera
+ 61 143 168 Teal
+ 79 184 214 Corpse
+157 107 216 Necrotic
+139 135 120 Ash
+255 255 255 White
+  0   0   0 Black

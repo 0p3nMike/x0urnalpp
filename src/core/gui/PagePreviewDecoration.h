@@ -66,5 +66,5 @@ private:
     static constexpr double PREVIEW_WIDTH_INDENT = 21;
     static constexpr double PREVIEW_HEIGHT_INDENT = 21;
 
-    static constexpr char FONT_NAME[] = "Sans";
+    static constexpr char FONT_NAME[] = "BigBlueTerm437 Nerd Font Mono";  // X0urnal++
 };

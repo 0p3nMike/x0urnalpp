@@ -1,6 +1,13 @@
 #include "MainWindow.h"
 
+#include <algorithm>  // X0urnal++ theme
+#include <cctype>     // X0urnal++ theme
+#include <fstream>    // X0urnal++ theme
+#include <iterator>   // X0urnal++ theme
+#include <map>        // X0urnal++ theme
 #include <regex>
+#include <sstream>  // X0urnal++ theme
+#include <string>   // X0urnal++ theme
 
 #include <gdk-pixbuf/gdk-pixbuf.h>  // for gdk_pixbuf_new_fr...
 #include <gdk/gdk.h>                // for gdk_screen_get_de...
@@ -23,6 +30,7 @@
 #include "gui/SearchBar.h"                              // for SearchBar
 #include "gui/inputdevices/InputEvents.h"               // for INPUT_DEVICE_TOUC...
 #include "gui/menus/menubar/Menubar.h"                  // for Menubar
+#include "gui/menus/menubar/TouchMenubar.h"  // X0urnal++
 #include "gui/menus/menubar/ToolbarSelectionSubmenu.h"  // for ToolbarSelectionSubmenu
 #include "gui/scroll/ScrollHandling.h"                  // for ScrollHandling
 #include "gui/sidebar/Sidebar.h"                        // for Sidebar
@@ -109,6 +117,15 @@ MainWindow::MainWindow(GladeSearchpath* gladeSearchPath, Control* control, GtkAp
     gtk_window_set_default_size(GTK_WINDOW(this->window), control->getSettings()->getMainWndWidth(),
                                 control->getSettings()->getMainWndHeight());
 
+    // X0urnal++: X0URNAL_FRAMELESS=1 drops the title bar, for a tiling window
+    // manager that already owns the frame (the caption would be a row of buttons
+    // for what a keybind does, costing ~30px of every window). On Wayland this
+    // declines client-side decoration. Off by default: on a floating desktop the
+    // frame is what moves and resizes the window.
+    if (const char* frameless = g_getenv("X0URNAL_FRAMELESS"); frameless && g_strcmp0(frameless, "0") != 0) {
+        gtk_window_set_decorated(GTK_WINDOW(this->window), FALSE);
+    }
+
     if (control->getSettings()->isMainWndMaximized()) {
         gtk_window_maximize(GTK_WINDOW(this->window));
     } else {
@@ -139,6 +156,15 @@ void MainWindow::populate(GladeSearchpath* gladeSearchPath) {
 
     toolbar->populate(gladeSearchPath);
     menubar->populate(gladeSearchPath, this);
+
+    /* X0urnal++: the same menus as a row of popover buttons at the top of the window, so a finger
+       or a pen opens them (TouchMenubar.h). GTK's own menubar stays hidden. */
+    this->touchMenubar = x0urnal::buildTouchMenubar(menubar->getModel());
+    if (GtkWidget* box = get("mainBox")) {
+        gtk_box_pack_start(GTK_BOX(box), this->touchMenubar, false, true, 0);
+        gtk_box_reorder_child(GTK_BOX(box), this->touchMenubar, 0);
+    }
+    setMenubarVisible(control->getSettings()->isMenubarVisible());
 
     // need to create tool buttons registered in plugins, so they can be added to toolbars
     control->registerPluginToolButtons(this->toolbar.get());
@@ -265,6 +291,13 @@ void MainWindow::updateColorscheme() {
 
     if (this->darkMode) {
         gtk_style_context_add_class(context, "darkMode");
+        if (props.darkSuffix) {
+            // X0urnal++: a "-dark"-suffixed NAME (gsettings "Adwaita-dark") is not a theme GTK3 can find;
+            // only the root name has a dark VARIANT. Ask for root + prefer-dark, or GTK falls back to
+            // light Adwaita (gtkcssprovider.c _gtk_css_provider_load_named).
+            g_object_set(gtk_widget_get_settings(this->window), "gtk-theme-name", props.rootname.c_str(), nullptr);
+            modifiedGtkSettingsTheme = true;
+        }
         g_object_set(gtk_widget_get_settings(this->window), "gtk-application-prefer-dark-theme", true, nullptr);
     } else {
         gtk_style_context_remove_class(context, "darkMode");
@@ -608,7 +641,12 @@ void MainWindow::setToolbarVisible(bool visible) {
 }
 
 void MainWindow::setMenubarVisible(bool visible) {
-    gtk_application_window_set_show_menubar(GTK_APPLICATION_WINDOW(this->getWindow()), visible);
+    /* X0urnal++: GTK's popup menubar can't be opened by touch (TouchMenubar.h), so it is always
+       hidden and the popover row follows the Show Menubar setting instead. */
+    gtk_application_window_set_show_menubar(GTK_APPLICATION_WINDOW(this->getWindow()), false);
+    if (this->touchMenubar) {
+        gtk_widget_set_visible(this->touchMenubar, visible);
+    }
 }
 
 void MainWindow::setMaximized(bool maximized) { this->maximized = maximized; }
@@ -719,10 +757,116 @@ auto MainWindow::getToolbarModel() const -> ToolbarModel* { return this->toolbar
 
 auto MainWindow::getToolMenuHandler() const -> ToolMenuHandler* { return this->toolbar.get(); }
 
+// X0urnal++ theme: the stylesheet follows the house map, ~/.config/sw4tch/house-map (see
+// Settings.cpp): `<house hex> <themed hex>` per line, empty or absent for the house theme. Every
+// #rrggbb in the stylesheet that the table names is swapped; everything else is left exactly as
+// shipped. The map's folder is watched, so a theme switch applies while the app runs.
+void reloadHouseMapColours();  // Settings.cpp: re-read the table the settings colours use
+namespace {
+auto houseThemed(std::string css) -> std::string {
+    auto lower = [](std::string s) {
+        for (auto& c: s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    std::map<std::string, std::string> table;
+    std::ifstream in(std::string(g_get_home_dir()) + "/.config/sw4tch/house-map");
+    for (std::string line; std::getline(in, line);) {
+        std::istringstream words(line.substr(0, line.find('#')));
+        std::string from, to;
+        if (words >> from >> to && from.size() == 6 && to.size() == 6) {
+            table[lower(from)] = lower(to);
+        }
+    }
+    if (table.empty()) {
+        return css;
+    }
+    auto isHex = [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; };
+    for (size_t i = 0; (i = css.find('#', i)) != std::string::npos; ++i) {
+        if (i + 7 > css.size() || (i + 7 < css.size() && isHex(css[i + 7]))) {
+            continue;
+        }
+        auto hex = css.substr(i + 1, 6);
+        if (!std::all_of(hex.begin(), hex.end(), isHex)) {
+            continue;
+        }
+        if (auto it = table.find(lower(hex)); it != table.end()) {
+            css.replace(i + 1, 6, it->second);
+        }
+    }
+    return css;
+}
+
+// --- live re-theme ------------------------------------------------------------------------------
+auto houseCss() -> std::string& {
+    static std::string css;
+    return css;
+}
+struct HouseMapWatch {
+    GtkCssProvider* provider = nullptr;
+    GFileMonitor* monitor = nullptr;
+    guint pending = 0;
+    std::string lastMap;
+};
+auto houseMapWatch() -> HouseMapWatch& {
+    static HouseMapWatch live;
+    return live;
+}
+auto readHouseMap() -> std::string {
+    std::ifstream in(std::string(g_get_home_dir()) + "/.config/sw4tch/house-map", std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+auto applyHouseMap(gpointer) -> gboolean {
+    auto& live = houseMapWatch();
+    live.pending = 0;
+    auto now = readHouseMap();
+    if (now == live.lastMap) {
+        return G_SOURCE_REMOVE;  // a touch, or another file in the folder
+    }
+    live.lastMap = now;
+    reloadHouseMapColours();
+    auto css = houseThemed(std::string(houseCss()));
+    gtk_css_provider_load_from_data(live.provider, css.c_str(), static_cast<gssize>(css.size()), nullptr);
+    GList* windows = gtk_window_list_toplevels();
+    for (GList* it = windows; it != nullptr; it = it->next) {
+        gtk_widget_queue_draw(GTK_WIDGET(it->data));
+    }
+    g_list_free(windows);
+    return G_SOURCE_REMOVE;
+}
+void onHouseMapChanged(GFileMonitor*, GFile*, GFile*, GFileMonitorEvent, gpointer) {
+    auto& live = houseMapWatch();
+    if (live.pending != 0) {
+        g_source_remove(live.pending);  // one write raises several events: settle first
+    }
+    live.pending = g_timeout_add(150, applyHouseMap, nullptr);
+}
+void watchHouseMap(GtkCssProvider* provider) {
+    auto& live = houseMapWatch();
+    if (live.monitor != nullptr) {
+        return;
+    }
+    live.provider = GTK_CSS_PROVIDER(g_object_ref(provider));
+    live.lastMap = readHouseMap();
+    auto dir = std::string(g_get_home_dir()) + "/.config/sw4tch";
+    GFile* folder = g_file_new_for_path(dir.c_str());
+    live.monitor = g_file_monitor_directory(folder, G_FILE_MONITOR_NONE, nullptr, nullptr);
+    g_object_unref(folder);
+    if (live.monitor != nullptr) {
+        g_signal_connect(live.monitor, "changed", G_CALLBACK(onHouseMapChanged), nullptr);
+    }
+}
+}  // namespace
+
 void MainWindow::loadMainCSS(GladeSearchpath* gladeSearchPath, const gchar* cssFilename) {
     auto filepath = gladeSearchPath->findFile("", cssFilename);
     xoj::util::GObjectSPtr<GtkCssProvider> provider(gtk_css_provider_new(), xoj::util::adopt);
-    gtk_css_provider_load_from_path(provider.get(), char_cast(filepath.u8string().c_str()), nullptr);
+    // X0urnal++ theme: the stylesheet's house colours through the house map
+    std::ifstream cssIn(filepath, std::ios::binary);
+    std::string css((std::istreambuf_iterator<char>(cssIn)), std::istreambuf_iterator<char>());
+    houseCss() = css;  // the house text, kept for a live re-theme
+    css = houseThemed(std::move(css));
+    gtk_css_provider_load_from_data(provider.get(), css.c_str(), static_cast<gssize>(css.size()), nullptr);
+    watchHouseMap(provider.get());  // follow a theme change live
     gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(provider.get()),
                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
 }

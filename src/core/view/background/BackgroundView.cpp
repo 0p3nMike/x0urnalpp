@@ -83,7 +83,13 @@ auto BackgroundView::createForPage(ConstPageRef page, BackgroundFlags bgFlags, P
         }
     } else {
         if (bgFlags.showRuling) {
-            return createRuled(width, height, page->getBackgroundColor(), pt);
+            auto view = createRuled(width, height, page->getBackgroundColor(), pt);
+            /* X0urnal++: on an infinite canvas the paper follows the viewport
+               instead of stopping at the page rectangle. */
+            if (view && page->isInfiniteCanvas()) {
+                view->unbounded = true;
+            }
+            return view;
         }
     }
 

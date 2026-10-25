@@ -13,6 +13,7 @@
 #include <gtk/gtk.h>  // for gtk_adjustment_get_value
 
 #include "control/Control.h"                    // for Control
+#include "model/XojPage.h"                      // X0urnal++: isInfiniteCanvas needs the complete type
 #include "control/ToolEnums.h"                  // for TOOL_HAND, TOOL_IMAGE
 #include "control/ToolHandler.h"                // for ToolHandler
 #include "control/settings/Settings.h"          // for Settings
@@ -371,7 +372,12 @@ auto PenInputHandler::actionMotion(InputEvent const& event) -> bool {
         // Relay the event to the page
         PositionInputData pos = getInputDataRelativeToCurrentPage(sequenceStartPage, event);
 
-        if (!toolHandler->acceptsOutOfPageEvents()) {
+        /* X0urnal++: an infinite-canvas page has no meaningful edge to clamp to
+           -- it grows to follow the pen (see StrokeHandler) -- so clamping here
+           would stop a stroke dead at the current boundary. */
+        const bool infinitePage =
+                sequenceStartPage->getPage() && sequenceStartPage->getPage()->isInfiniteCanvas();
+        if (!toolHandler->acceptsOutOfPageEvents() && !infinitePage) {
             // Enforce input to stay within page
             pos.x = std::clamp(pos.x, 0.0, static_cast<double>(sequenceStartPage->getDisplayWidth()));
             pos.y = std::clamp(pos.y, 0.0, static_cast<double>(sequenceStartPage->getDisplayHeight()));

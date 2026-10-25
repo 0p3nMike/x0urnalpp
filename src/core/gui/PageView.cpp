@@ -78,6 +78,7 @@
 #include "util/safe_casts.h"                        // for ceil_cast, floor_cast, round_cast
 #include "util/serdesstream.h"                      // for serdes_stream
 #include "view/DebugShowRepaintBounds.h"            // for IF_DEBUG_REPAINT
+#include "view/ViewportBuffer.h"                 // X0urnal++
 #include "view/overlays/OverlayView.h"              // for OverlayView, Tool...
 #include "view/overlays/PdfElementSelectionView.h"  // for PdfElementSelecti...
 #include "view/overlays/SearchResultView.h"         // for SearchResultView
@@ -1058,7 +1059,16 @@ auto XojPageView::paintPage(cairo_t* cr, GdkRectangle* rect) -> bool {
             return true;
         }
 
-        if (this->buffer.getZoom() != zoom) {
+        if (this->buffer.getZoom() != zoom || this->needsBufferRealloc()) {
+            /*
+             * X0urnal++: the same treatment upstream already gives a zoom change
+             * is now also given a viewport move. Re-render asynchronously and
+             * meanwhile keep painting the buffer we have -- Mask::paintTo
+             * positions by offset, so a stale buffer still lands in the right
+             * place and degrades to missing edges rather than wrong content.
+             * This is the "show the coarse version now, refine it shortly"
+             * trick that map renderers and games use to avoid pop-in.
+             */
             rerenderPage();
             cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_FAST);
         }
@@ -1086,6 +1096,17 @@ auto XojPageView::paintPage(cairo_t* cr, GdkRectangle* rect) -> bool {
 auto XojPageView::isSelected() const -> bool { return selected; }
 
 auto XojPageView::hasBuffer() const -> bool { return this->buffer.isInitialized(); }
+
+/*
+ * X0urnal++: only an infinite-canvas page can ever need this -- every other page
+ * holds its whole self and the answer is always false.
+ */
+auto XojPageView::needsBufferRealloc() const -> bool {
+    if (!this->page->isInfiniteCanvas()) {
+        return false;
+    }
+    return xoj::view::ViewportBuffer::needsRealloc(this->residentRange, this->getVisiblePart());
+}
 
 auto XojPageView::getSelectionColor() -> GdkRGBA { return Util::rgb_to_GdkRGBA(settings->getSelectionColor()); }
 

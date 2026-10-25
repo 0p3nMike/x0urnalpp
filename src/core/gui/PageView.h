@@ -27,6 +27,7 @@
 #include "model/PageRef.h"            // for PageRef
 #include "util/Rectangle.h"           // for Rectangle
 #include "util/raii/CairoWrappers.h"  // for CairoSurfaceSPtr
+#include "util/Range.h"  // X0urnal++: residentRange is a value member
 #include "view/Mask.h"                // for Mask
 #include "view/Repaintable.h"         // for Repaintable
 
@@ -283,6 +284,20 @@ private:
     bool selected = false;
 
     xoj::view::Mask buffer;
+
+    /**
+     * X0urnal++: the part of the page currently held in `buffer`.
+     *
+     * For an ordinary page this is the whole page and never changes. For an
+     * infinite-canvas page it follows the viewport -- see view/ViewportBuffer.h.
+     */
+    Range residentRange;
+
+public:
+    /// X0urnal++: whether the viewport has left the region held in `buffer`.
+    bool needsBufferRealloc() const;
+
+private:
     std::mutex drawingMutex;
 
     bool inEraser = false;
