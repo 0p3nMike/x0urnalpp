@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# one2book-sync -- bring OneNote notebooks into synced X0urnal++ books, again and again: each run
+# converts what changed in OneNote and merges it into the book, so the book can be written in on
+# every device while OneNote is still in use.
+#
+#   one2book-sync NAME=SOURCE [NAME=SOURCE ...]   these notebooks
+#   one2book-sync                                 every notebook in ~/.config/one2book/notebooks
+#   one2book-sync [--no-copy] [NAME ...]          only those (from the file); --no-copy converts
+#                                                 what the mirror already has (after a one2book
+#                                                 update, or while the source is away)
+#
+# SOURCE is a OneNote notebook folder (its .one and .onetoc2 files) or a notebook exported from
+# OneNote as .onepkg (File > Export > Notebook), as a local path: a mounted share or a synced
+# folder works too. NAME is the book's name, Documents/notebooks/NAME.book on every device.
+# The file ~/.config/one2book/notebooks has one "NAME|SOURCE" line per notebook (# comments).
+#
+# For each notebook:
+#   1. copy the files that changed into a mirror (~/.cache/one2book/src/<name>/). OneNote saves
+#      sections in place, so a copy taken mid-save is torn; every copy is checked against the
+#      source's size and modified time AFTER it lands and retried until the file held still.
+#   2. if anything changed, convert it with one2book into a scratch book folder
+#      (~/.cache/one2book/books/<name>.book/, its report beside it as <name>.log).
+#   3. import the conversion (../book-sync/README.md "The OneNote import"). The import keeps its
+#      own git clone of the book's repo (<remote base>/book-<slug>.git) at
+#      ~/.cache/one2book/repo/<name>.book/:
+#        a. the conversion replaces notebook.xml and sections/ on the branch `onenote`, committed
+#           as "onenote import" when anything changed -- so `onenote` is OneNote's side of the
+#           book, one commit per import;
+#        b. `main` is brought up to date (book-sync sync), `onenote` is merged into it with
+#           book-sync's merge drivers -- pages changed only in OneNote arrive, pages changed only
+#           in X0urnal++ stay, pages changed on both are merged stroke by stroke or get a conflict
+#           page -- and book-sync sync pushes main; `onenote` is pushed too.
+#      The first import of a book makes `main` the import itself and creates the remote repo
+#      (book-sync init).
+#   Devices get the books with book-sync (clone once, then X0urnal++ syncs them).
+#
+# Needs: cargo (one2book is built from this folder), git, book-sync, and a remote for book-sync
+# (BOOK_SYNC_REMOTE_BASE, or `git config --global book-sync.remote <base>`). Reads the sources,
+# never writes to them. Nothing here runs on a timer; it runs when you run it.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+CACHE=${XDG_CACHE_HOME:-$HOME/.cache}/one2book
+LIST=${ONE2BOOK_NOTEBOOKS:-${XDG_CONFIG_HOME:-$HOME/.config}/one2book/notebooks}
+# book-sync: from PATH, else the copy in this repo (../book-sync); ONE2BOOK_BOOK_SYNC overrides
+BOOKSYNC=${ONE2BOOK_BOOK_SYNC:-$(command -v book-sync || true)}
+[ -n "$BOOKSYNC" ] || BOOKSYNC="$HERE/../book-sync/book-sync"
+# where the books' repos live: the same place book-sync puts them (../book-sync/README.md "Remote")
+REMOTE_BASE=${BOOK_SYNC_REMOTE_BASE:-$(git config --get book-sync.remote || true)}
+# git over ssh must never stop to ask anything
+export GIT_SSH_COMMAND=${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}
+
+say() { printf '%s\n' "$*"; }
+
+# "<relative path>\t<size>\t<modified time>" for every section and table of contents under a
+# notebook folder (the recycle bin left out), or the one line for a .onepkg; MISSING if the source
+# isn't there.
+list_source() {
+    if [ -f "$1" ]; then
+        find "$1" -maxdepth 0 -printf '%f\t%s\t%T@\n'
+    elif [ -d "$1" ]; then
+        find "$1" -type f \( -name '*.one' -o -name '*.onetoc2' \) -not -path '*OneNote_RecycleBin*' \
+            -printf '%P\t%s\t%T@\n'
+    else
+        echo MISSING
+    fi
+}
+
+# Copy one file into the mirror and make sure it held still while it was copied.
+copy_still() {
+    local from=$1 to=$2 want=$3 try now
+    mkdir -p "$(dirname "$to")"
+    for try in 1 2 3 4 5; do
+        cp -f -- "$from" "$to.partial" 2>/dev/null || { sleep 5; continue; }
+        now=$(find "$from" -maxdepth 0 -printf '%s\t%T@')
+        if [ "$now" = "$want" ] && [ "$(stat -c %s "$to.partial")" = "${want%%$'\t'*}" ]; then
+            mv -f "$to.partial" "$to"
+            printf '%s' "$now"
+            return 0
+        fi
+        say "    $(basename "$to"): changed while copying (OneNote saving?), trying again" >&2
+        want=$now
+        sleep 10
+    done
+    rm -f -- "${to:?}.partial"
+    return 1
+}
+
+# --- the import (step 3) ------------------------------------------------------------------------
+
+# The repo name of a book: its folder name without .book, lowercased, anything outside
+# [a-z0-9-] -> '-' (../book-sync/README.md "Remote").
+slug_of() { local s=${1,,}; printf '%s' "${s//[^a-z0-9-]/-}"; }
+
+# One checksum over every file of a book folder: what was last committed on `onenote` is kept as
+# this, so an unchanged conversion skips the checkout-copy-commit round entirely.
+folder_sum() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) | sha256sum | cut -d' ' -f1; }
+
+# What the remote has for a book: "main" (a repo with a main branch), "none" (no repo, or an
+# empty one -- this is the book's first import) or "unreachable". `git ls-remote` fails the same
+# way for "no such repo" and "can't get there"; ssh's own messages say the second. Anything else
+# came from the server itself, which answered that it has no such repo.
+remote_has() {
+    local out rc=0
+    out=$(git ls-remote --heads "$1" 2>&1) || rc=$?
+    printf '   git ls-remote %s (exit %s):\n%s\n' "$1" "$rc" "$out" >> "$log"
+    if [ "$rc" = 0 ]; then
+        if grep -q $'\trefs/heads/main$' <<< "$out"; then echo main; else echo none; fi
+    elif grep -qiE 'ssh: |could not resolve|connection (timed out|refused|reset|closed)|network is unreachable|no route to host|host key verification|permission denied|kex_exchange|broken pipe|operation timed out' <<< "$out"; then
+        echo unreachable
+    else
+        echo none
+    fi
+}
+
+# Run `book-sync <cmd> <clone>` and read its JSON line into BS_STATE, BS_MSG and BS_CONFLICTS
+# (comma-separated conflict page ids). A command that printed no JSON (setup) gets "ok" or
+# "error" from its exit status. Returns 1 for state "error".
+bs() {
+    local out rc=0
+    out=$("$BOOKSYNC" "$1" "$clone" 2>>"$log") || rc=$?
+    printf '   book-sync %s -> %s\n' "$1" "${out:-(exit $rc)}" >> "$log"
+    IFS=$'\x1f' read -r BS_STATE BS_MSG BS_CONFLICTS < <(printf '%s\n' "$out" | python3 -c '
+import json, sys
+lines = sys.stdin.read().strip().splitlines()
+try:
+    d = json.loads(lines[-1])
+    print(d.get("state", "error"), " ".join(str(d.get("message", "")).split()), ",".join(d.get("conflicts") or []), sep="\x1f")
+except Exception:
+    print("\x1f\x1f")
+') || true
+    if [ -z "$BS_STATE" ]; then
+        if [ "$rc" = 0 ]; then BS_STATE=ok; else BS_STATE=error; BS_MSG="book-sync $1 failed (exit $rc, see $log)"; fi
+    fi
+    [ "$BS_STATE" != error ]
+}
+
+# a line for the terminal and the notebook's log alike
+note() { say "$*"; printf '%s\n' "$*" >> "$log"; }
+
+# Report a failed import step (the caller returns 1 right after). sync_one runs in an `||`, so
+# `set -e` is off in here, as it always was in sync_one: every step that matters is checked.
+fail() { note "   !! $1"; RESULT=$2; }
+
+# git in the import clone; its chatter goes to the log
+g() { git -C "$clone" "$@" >>"$log" 2>&1; }
+rev() { git -C "$clone" rev-parse -q --verify "$1" 2>/dev/null || true; }
+
+# The remote book-sync set up (origin, if that's among them)
+remote_of() { local r; r=$(git -C "$clone" remote 2>/dev/null); if grep -qx origin <<< "$r"; then echo origin; else head -n1 <<< "$r"; fi; }
+
+# "2 new, 3 changed, 1 gone" for the page files between two commits
+page_changes() {
+    git -C "$clone" diff --name-status --no-renames "$1" "$2" -- sections 2>/dev/null |
+        awk '{ n[substr($1, 1, 1)]++ } END { printf "%d pages new, %d changed, %d gone", n["A"], n["M"], n["D"] }'
+}
+
+# Push the import branch as well, so the remote holds OneNote's side of every merge.
+push_onenote() {
+    local r
+    r=$(remote_of)
+    [ -n "$r" ] || return 0
+    g push -q "$r" onenote || note "   (branch onenote not pushed this time; it goes with the next run)"
+}
+
+# Did book-sync's last answer mean "on the remote now"?
+landed() { [ "$BS_STATE" = synced ] || [ "$BS_STATE" = conflict ]; }
+
+# The first import of a book: main IS the conversion, `onenote` starts at the same commit, and
+# book-sync init creates the remote repo by pushing to it.
+first_import() {
+    local outer=$clone new="$clone.new"
+    rm -rf -- "${new:?}"
+    mkdir -p "$new" && cp -r "$book/notebook.xml" "$book/sections" "$new/" ||
+        { fail "can't copy the conversion into $new" "copy failed"; return 1; }
+    # main by name, whatever init.defaultBranch says
+    git init -q -b main "$new" 2>>"$log" || { fail "git init $new failed" "git failed"; return 1; }
+    clone=$new
+    if ! bs setup; then clone=$outer; fail "book-sync setup: $BS_MSG" "setup failed"; return 1; fi
+    if ! { g add -A && g commit -q -m "onenote import" && g branch onenote; }; then
+        clone=$outer; fail "the first commit failed (see $log)" "git failed"; return 1
+    fi
+    clone=$outer
+    # $clone has no .git (that's why we're here), so whatever is there is a leftover of ours
+    rm -rf -- "${clone:?}"
+    mv "$new" "$clone" || { fail "can't move $new to $clone" "move failed"; return 1; }
+    folder_sum "$book" > "$clone/.git/one2book-imported"
+    note "   first import: main = this conversion ($(find "$clone/sections" -name '*.xopp' | wc -l) pages)"
+    bs init || { fail "book-sync init: $BS_MSG -- the import is committed in $clone and goes up with the next run" "first import not pushed"; return 1; }
+    push_onenote
+    note "   -> book-$(slug_of "$name"): $BS_STATE${BS_MSG:+ ($BS_MSG)}"
+    RESULT="first import, $BS_STATE"
+    landed || [ "$BS_STATE" = ok ]
+}
+
+# Steps 3a and 3b for one notebook. Uses name, book (the conversion), log.
+import_book() {
+    local clone="$CACHE/repo/$name.book" slug url
+    slug=$(slug_of "$name")
+    url="${REMOTE_BASE%/}/book-$slug.git"
+    mkdir -p "$CACHE/repo"
+
+    if [ ! -d "$clone/.git" ]; then
+        case $(remote_has "$url") in
+            none) first_import; return ;;
+            unreachable) note "   can't reach the remote ($url, see $log); the conversion waits in $book"; RESULT="remote unreachable"; return 1 ;;
+            main)
+                # an import clone made afresh (the cache was cleared): clone without checking
+                # out, so the files are written only once book-sync's filters are configured;
+                # main by name, whatever the remote's default branch is; -f because setup has
+                # just written .gitattributes/.gitignore into the empty tree
+                rm -rf -- "${clone:?}"
+                git clone -q --no-checkout "$url" "$clone" 2>>"$log" || { fail "can't clone $url (see $log)" "clone failed"; return 1; }
+                bs setup || { fail "book-sync setup: $BS_MSG" "setup failed"; return 1; }
+                g checkout -q -f -B main origin/main || { fail "can't check out main in the fresh clone (see $log)" "git failed"; return 1; }
+                ;;
+        esac
+    fi
+
+    # 0. whatever a run that stopped part way left: a merge in progress is undone; a half-made
+    #    import commit on onenote is redone from scratch; anything new on main (conflict pages a
+    #    merge driver wrote) is kept and committed, the way devices keep theirs
+    if [ -f "$clone/.git/MERGE_HEAD" ]; then g merge --abort || { fail "can't undo the unfinished merge (see $log)" "git failed"; return 1; }; fi
+    if [ "$(git -C "$clone" symbolic-ref --short -q HEAD)" != main ]; then
+        { g reset -q --hard && g clean -fdq && g checkout -q main; } || { fail "can't get back onto main (see $log)" "git failed"; return 1; }
+    fi
+    bs setup || { fail "book-sync setup: $BS_MSG" "setup failed"; return 1; }
+    if [ -n "$(git -C "$clone" status --porcelain)" ]; then
+        bs save || { fail "book-sync save: $BS_MSG" "save failed"; return 1; }
+    fi
+    local remote
+    remote=$(remote_of)
+
+    # a. the conversion onto onenote
+    local sum
+    sum=$(folder_sum "$book")
+    if [ "$(cat "$clone/.git/one2book-imported" 2>/dev/null)" != "$sum" ]; then
+        if [ -z "$(rev refs/heads/onenote)" ]; then
+            # the remote may have it even if this clone hasn't seen it yet
+            if [ -n "$remote" ] && [ -z "$(rev "refs/remotes/$remote/onenote")" ]; then g fetch -q "$remote" || true; fi
+            if [ -n "$remote" ] && [ -n "$(rev "refs/remotes/$remote/onenote")" ]; then
+                g branch -q onenote "$remote/onenote" || { fail "can't make branch onenote (see $log)" "git failed"; return 1; }
+            else
+                # main exists but OneNote's side doesn't: the book was made somewhere else (an old
+                # zip copy imported on a device, ids n<k>?). Merging an unrelated import into it
+                # would put every page in twice, so stop and say so.
+                fail "book-$slug on the remote has a main branch but no onenote branch -- this import didn't make it" "remote repo not from this import"
+                note "      Importing would put every page in twice. Rename or remove that repo (and its clones), then run this again."
+                return 1
+            fi
+        fi
+        g checkout -q onenote && [ "$(git -C "$clone" symbolic-ref --short -q HEAD)" = onenote ] ||
+            { fail "can't check out onenote (see $log)" "git failed"; return 1; }
+        bs setup || true    # .gitattributes/.gitignore as book-sync writes them today
+        rm -rf -- "${clone:?}/sections" "${clone:?}/notebook.xml"
+        if ! { cp -r "$book/notebook.xml" "$book/sections" "$clone/" && g add -A; }; then
+            g reset -q --hard; g checkout -q main
+            fail "can't put the conversion on onenote (see $log)" "copy failed"; return 1
+        fi
+        local before
+        before=$(rev onenote)
+        if ! git -C "$clone" diff --cached --quiet; then
+            g commit -q -m "onenote import" || { g reset -q --hard; g checkout -q main; fail "the onenote commit failed (see $log)" "git failed"; return 1; }
+        fi
+        g checkout -q main || { fail "can't get back onto main (see $log)" "git failed"; return 1; }
+        printf '%s\n' "$sum" > "$clone/.git/one2book-imported"
+        if [ "$(rev onenote)" != "$before" ]; then
+            note "   onenote: import committed ($(page_changes "$before" onenote))"
+        else
+            note "   onenote: the conversion is what the last import already has"
+        fi
+    fi
+
+    # b. merge into main and push -- or nothing at all (no network) when main has the import and
+    #    the remote has both branches
+    local need_merge=0 need_push=0
+    git -C "$clone" merge-base --is-ancestor onenote main 2>/dev/null || need_merge=1
+    if [ -z "$remote" ] || [ "$(rev "refs/remotes/$remote/main")" != "$(rev main)" ] ||
+       [ "$(rev "refs/remotes/$remote/onenote")" != "$(rev onenote)" ]; then
+        need_push=1
+    fi
+    if [ "$need_merge" = 0 ] && [ "$need_push" = 0 ]; then
+        note "   no changes"
+        RESULT="no changes"
+        return 0
+    fi
+    if [ -z "$remote" ]; then
+        # the first import never reached the remote (book-sync init failed last time): again
+        bs init || { fail "book-sync init: $BS_MSG" "not pushed"; return 1; }
+        remote=$(remote_of)
+    fi
+
+    local made=""
+    if [ "$need_merge" = 1 ]; then
+        # main as the remote has it now, so the merge meets the devices' latest writing. Offline
+        # is fine (merged here, pushed next time); an error is not.
+        bs sync || { fail "book-sync sync before the merge: $BS_MSG -- main left as it was" "sync failed"; return 1; }
+        # A plain git merge, so book-sync's drivers do the work (configured by setup). Conflict
+        # pages they make are named after OneNote rather than after the machine that runs the
+        # import (BOOK_SYNC_THEIR_DEVICE, which book-sync's drivers read).
+        if ! env BOOK_SYNC_THEIR_DEVICE=onenote git -C "$clone" merge -q --no-edit -m "onenote import" onenote >>"$log" 2>&1; then
+            local stuck
+            stuck=$(git -C "$clone" diff --name-only --diff-filter=U | tr '\n' ' ')
+            g merge --abort || true
+            fail "merging the import into main stopped at: ${stuck:-(see $log)}" "merge failed"
+            note "      main is as it was; the import waits on branch onenote and is merged at the next run"
+            push_onenote
+            return 1
+        fi
+        note "   main: merged the import ($(page_changes ORIG_HEAD HEAD))"
+        # the conflict pages that merge made, committed by now or still waiting for the save
+        made=$( { git -C "$clone" diff --name-only --diff-filter=A ORIG_HEAD HEAD -- sections
+                  git -C "$clone" ls-files --others --exclude-standard -- sections; } 2>/dev/null |
+                sed -n 's|^sections/\(.*-conflict-.*\)\.xopp$|\1|p' | sort -u | paste -sd, -)
+    fi
+    bs sync || { fail "book-sync sync: $BS_MSG" "sync failed"; push_onenote; return 1; }
+    push_onenote
+    note "   -> book-$slug: $BS_STATE${BS_MSG:+ ($BS_MSG)}"
+    local conflicts
+    conflicts=$(printf '%s\n' "${made//,/$'\n'}" "${BS_CONFLICTS//,/$'\n'}" | sed '/^$/d' | sort -u | paste -sd, -)
+    if [ -n "$conflicts" ]; then
+        note "   conflict pages (changed on both sides; keep one, remove the other): ${conflicts//,/, }"
+    fi
+    RESULT="imported, $BS_STATE${conflicts:+ (conflict pages)}"
+    landed
+}
+
+sync_one() {
+    local name=$1 src=$2
+    local mirror="$CACHE/src/$name" book="$CACHE/books/$name.book" log="$CACHE/books/$name.log" leaf=0
+    mkdir -p "$mirror" "$CACHE/books"
+    RESULT=""
+    say "== $name"
+    case "$src" in *.onepkg) leaf=1 ;; esac
+    say "   source: $src"
+
+    # 1. copy what changed
+    local changed=0
+    if [ "$NOCOPY" = 1 ]; then
+        say "   (not reading the source: importing what the mirror has)"
+    else
+        local listing
+        listing=$(list_source "$src")
+        if [ "$listing" = MISSING ]; then say "   not there: $src -- skipped"; RESULT="source missing"; return 0; fi
+
+        local manifest="$mirror/.manifest" new="$mirror/.manifest.new" rel size mtime got dst from
+        : > "$new"
+        while IFS=$'\t' read -r rel size mtime; do
+            [ -n "$rel" ] || continue
+            if [ "$leaf" = 1 ]; then dst="$mirror/$name.onepkg"; from=$src; else dst="$mirror/$rel"; from="$src/$rel"; fi
+            if [ -f "$dst" ] && grep -qxF "$rel"$'\t'"$size"$'\t'"$mtime" "$manifest" 2>/dev/null; then
+                printf '%s\t%s\t%s\n' "$rel" "$size" "$mtime" >> "$new"
+                continue
+            fi
+            say "   copy $rel"
+            if got=$(copy_still "$from" "$dst" "$size"$'\t'"$mtime"); then
+                printf '%s\t%s\n' "$rel" "$got" >> "$new"
+                changed=1
+            else
+                say "   !! $rel kept changing; left out of this run"
+            fi
+        done <<< "$listing"
+        # sections deleted from the source leave the mirror too
+        if [ "$leaf" = 0 ] && [ -f "$manifest" ]; then
+            while IFS=$'\t' read -r rel _; do
+                if ! cut -f1 "$new" | grep -qxF "$rel"; then
+                    say "   gone from the source: $rel"; rm -f -- "${mirror:?}/${rel:?}"; changed=1
+                fi
+            done < "$manifest"
+        fi
+        mv -f "$new" "$manifest"
+    fi
+    local input=$mirror
+    [ "$leaf" = 1 ] && input="$mirror/$name.onepkg"
+    if [ ! -e "$input" ] || [ -z "$(find "$mirror" -name '*.one*' -print -quit)" ]; then
+        say "   nothing mirrored yet -- skipped"; RESULT="nothing mirrored"; return 0
+    fi
+
+    # 2. convert if anything changed (a newer one2book counts: its fixes should land). "Changed"
+    #    is judged by the mirror itself -- every file's name, size and time, against the list
+    #    the last conversion was made from -- so --no-copy and a hand-fixed mirror count too.
+    local srcstate
+    srcstate=$(cd "$mirror" && find . -type f \( -name '*.one' -o -name '*.onetoc2' -o -name '*.onepkg' \) -printf '%P\t%s\t%T@\n' | LC_ALL=C sort)
+    if [ "$changed" = 1 ] || [ ! -f "$book/notebook.xml" ] || [ "$BIN" -nt "$book/notebook.xml" ] ||
+       [ "$srcstate" != "$(cat "$CACHE/books/$name.src" 2>/dev/null)" ]; then
+        local status=0
+        rm -f -- "${CACHE:?}/books/${name:?}.src"
+        "$BIN" "$input" "$book" > "$log" || status=$?
+        sed 's/^/   /' "$log"
+        if [ "$status" = 1 ]; then say "   !! one2book failed; the book keeps the previous import"; RESULT="conversion failed"; return 1; fi
+        if [ "$status" = 2 ]; then
+            # Some sections could not be read. Importing this would delete their pages from the
+            # book on every device until the next good import, so it isn't imported, and the
+            # partial conversion goes so the next run converts again.
+            rm -rf -- "${book:?}"
+            say "   !! some sections could not be read (FAILED above); not imported -- the book keeps the previous import"
+            RESULT="sections unreadable, not imported"
+            return 1
+        fi
+        printf '%s\n' "$srcstate" > "$CACHE/books/$name.src"
+    else
+        say "   OneNote unchanged since the last conversion"
+    fi
+
+    # 3. import it
+    if [ ! -x "$BOOKSYNC" ]; then
+        say "   !! book-sync not found (PATH, or $HERE/../book-sync/book-sync): not imported; the conversion waits in $book"
+        RESULT="book-sync missing"
+        return 1
+    fi
+    printf -- '-- import %s\n' "$(date '+%F %T')" >> "$log"
+    import_book
+}
+
+NOCOPY=0
+if [ "${1:-}" = --no-copy ]; then NOCOPY=1; shift; fi
+
+# the notebooks: NAME=SOURCE arguments, or the list file (all of it, or the NAMEs given)
+NOTEBOOKS=()
+if [ $# -gt 0 ] && [[ "$1" == *=* ]]; then
+    for arg in "$@"; do
+        [[ "$arg" == *=* ]] || { say "expected NAME=SOURCE, got: $arg"; exit 2; }
+        NOTEBOOKS+=("${arg%%=*}|${arg#*=}")
+    done
+    set --
+elif [ -f "$LIST" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}
+        line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        [ -n "$line" ] && NOTEBOOKS+=("$line")
+    done < "$LIST"
+fi
+if [ ${#NOTEBOOKS[@]} = 0 ]; then
+    say "no notebooks: give NAME=SOURCE arguments, or list them as NAME|SOURCE lines in $LIST"
+    exit 2
+fi
+if [ -z "$REMOTE_BASE" ]; then
+    say "no remote for the books: set BOOK_SYNC_REMOTE_BASE, or run git config --global book-sync.remote <base>"
+    exit 2
+fi
+
+# one run at a time: two would fight over the mirror and the import clones
+mkdir -p "$CACHE"
+exec 9> "$CACHE/.one2book-sync.lock"
+flock -n 9 || { say "one2book-sync is already running"; exit 1; }
+
+# build (or find up to date) the converter
+cargo build -q --release --manifest-path "$HERE/Cargo.toml"
+BIN="$HERE/target/release/one2book"
+
+rc=0
+SUMMARY=()
+for entry in "${NOTEBOOKS[@]}"; do
+    name=${entry%%|*}; src=${entry#*|}
+    if [ $# -gt 0 ] && [[ " $* " != *" $name "* ]]; then continue; fi
+    sync_one "$name" "$src" || { rc=1; RESULT="!! ${RESULT:-failed}"; }
+    SUMMARY+=("$(printf '   %-24s %s' "$name" "$RESULT")")
+done
+say "== summary"
+printf '%s\n' "${SUMMARY[@]}"
+exit $rc

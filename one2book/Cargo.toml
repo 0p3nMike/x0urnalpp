@@ -1,0 +1,17 @@
+[package]
+name = "one2book"
+version = "0.2.0"
+edition = "2024"
+description = "OneNote notebooks -> X0urnal++ .book notebook folders, handwriting kept as editable strokes"
+license = "MIT"
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+flate2 = "1.1.10"
+# vendored onenote_parser 2.1.0 (MPL-2.0) carrying the one2book fragment-parsing fix; see vendor/onenote_parser
+onenote_parser = { path = "vendor/onenote_parser", features = ["onepkg"] }
+# section ids: on-sec-<16 hex of sha256(path in the notebook)>, see src/ids.rs
+sha2 = "0.11.1"
+typed-path = "0.12"
+zip = { version = "9.1.0", default-features = false, features = ["deflate"] }
