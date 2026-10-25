@@ -1,0 +1,60 @@
+# X0urnal++ for Arch Linux (x86_64 and aarch64): the app in /opt/X0urnal++, beside the distro's
+# xournalpp, and book-sync on PATH.
+#
+#   makepkg -si
+pkgname=x0urnalpp
+pkgver=1.3.7
+pkgrel=6
+pkgdesc="X0urnal++: Xournal++ with an infinite canvas, notebooks and git sync -- a OneNote replacement"
+arch=('x86_64' 'aarch64')
+url="https://github.com/0p3nMike/x0urnalpp"
+license=('GPL-2.0-or-later' 'MIT')
+depends=('gtk3' 'libxml2' 'portaudio' 'libsndfile' 'poppler-glib' 'libzip' 'lua' 'gtksourceview4'
+         'qpdf' 'librsvg' 'zlib' 'glib2' 'cairo' 'pango' 'gdk-pixbuf2' 'hicolor-icon-theme'
+         'python' 'git')
+makedepends=('cmake' 'ninja' 'gettext' 'help2man')
+optdepends=('ttf-bigblueterminal-nerd: the font the theme is drawn in')
+options=('!lto' '!debug')
+source=("x0urnalpp::git+https://github.com/0p3nMike/x0urnalpp.git#tag=x0urnal-${pkgver}-${pkgrel}")
+sha256sums=('SKIP')
+
+_prefix=/opt/X0urnal++
+
+build() {
+  cmake -S x0urnalpp -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$_prefix"
+  ninja -C build
+}
+
+check() {
+  cd x0urnalpp/book-sync
+  ./run-tests >/dev/null
+}
+
+package() {
+  DESTDIR="$pkgdir" ninja -C build install
+  ln -sfn xournalpp "$pkgdir$_prefix/bin/X0urnal++"
+
+  # A launcher entry that starts this build, not the distro's xournalpp.
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/x0urnalpp.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=X0urnal++
+GenericName=Notebook
+Comment=Handwritten notes in notebooks, synced across devices
+Exec=$_prefix/bin/X0urnal++ %f
+Icon=com.github.xournalpp.xournalpp
+StartupWMClass=com.github.xournalpp.xournalpp
+Terminal=false
+MimeType=application/x-xopp;application/pdf
+Categories=Office;GTK
+DESKTOP
+
+  # book-sync and its merge drivers; git runs the drivers by their real path
+  install -d "$pkgdir/usr/lib/book-sync" "$pkgdir/usr/bin"
+  install -m755 x0urnalpp/book-sync/{book-sync,xopp-merge,notebook-merge,xopp-filter} "$pkgdir/usr/lib/book-sync/"
+  install -m644 x0urnalpp/book-sync/booklib.py "$pkgdir/usr/lib/book-sync/"
+  ln -s /usr/lib/book-sync/book-sync "$pkgdir/usr/bin/book-sync"
+  install -Dm644 x0urnalpp/book-sync/LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-book-sync"
+}
