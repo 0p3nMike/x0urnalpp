@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# run-tests -- the book-sync test suite (unit tests + end-to-end tests with local bare repos).
+#   ./run-tests            everything
+#   ./run-tests -k text    only tests whose name matches
+# Scratch repos go under $BOOKSYNC_TEST_TMP (default: the system temp dir) and are removed after
+# each test unless BOOKSYNC_KEEP=1. Nothing touches the network or ~/Documents/notebooks.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/tests"
+exec python3 -m unittest discover -s . -p 'test_*.py' -v "$@"

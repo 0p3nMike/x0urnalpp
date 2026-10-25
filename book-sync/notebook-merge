@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""notebook-merge -- git merge driver for a book's notebook.xml (merge=notebook).
+
+    notebook-merge %O %A %B        base, ours, theirs
+
+Configured by `book-sync setup`. Merges the tree by node id (booklib.merge_notebooks; rules in
+the README): union of nodes, a delete wins only over an unchanged node, a rename or move on one
+side wins, ours wins when both changed the same thing. Writes the README's one-node-per-line
+form to %A and always exits 0.
+
+A title both sides changed differently keeps ours; theirs is recorded in
+<book>/.book-sync/titles.jsonl so book-sync can use it in the title of that page's conflict page
+(if the page's content also conflicted) or mention it in its message.
+
+If a version is unreadable: ours unreadable -> theirs is written (ours' pages are still files in
+sections/ and `book-sync sync` puts them back under "Recovered"); theirs unreadable -> ours stays,
+and theirs' new pages come back the same way.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))   # booklib beside the real file
+
+import booklib  # noqa: E402
+
+
+def _read(p):
+    try:
+        with open(p, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def _parse(data):
+    try:
+        return booklib.parse_notebook(data)
+    except ValueError:
+        return None
+
+
+def main(argv):
+    if len(argv) < 4:
+        sys.stderr.write("usage: notebook-merge %O %A %B\n")
+        return 2
+    o, a, b = argv[1], argv[2], argv[3]
+    base, ours, theirs = _read(o), _read(a), _read(b)
+    nb_a, nb_t = _parse(ours), _parse(theirs)
+    if nb_a is None and nb_t is None:
+        sys.stderr.write("notebook-merge: neither version of notebook.xml can be read; kept ours\n")
+        return 0
+    if nb_a is None:
+        sys.stderr.write("notebook-merge: our notebook.xml cannot be read; took theirs\n")
+        with open(a, "wb") as f:
+            f.write(theirs)
+        return 0
+    if nb_t is None:
+        sys.stderr.write("notebook-merge: their notebook.xml cannot be read; kept ours\n")
+        return 0
+    nb_b = _parse(base) or booklib.empty_notebook()
+    merged, titles = booklib.merge_notebooks(nb_b, nb_a, nb_t)
+    out = booklib.serialize_notebook(merged)
+    with open(a, "wb") as f:
+        f.write(out)
+    if titles:
+        top = booklib.worktree_top()
+        if top:
+            for nid, ours_t, theirs_t in titles:
+                booklib.add_pending(top, booklib.PENDING_TITLES, {"id": nid, "ours": ours_t, "theirs": theirs_t})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

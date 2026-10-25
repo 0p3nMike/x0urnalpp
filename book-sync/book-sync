@@ -1,0 +1,1655 @@
+#!/usr/bin/env python3
+"""book-sync -- keep X0urnal++ folder books in step across devices through a git remote.
+
+    book-sync setup  <book>            git init if needed, drivers + filter in .git/config,
+                                       .gitattributes, .gitignore, user.name = device (idempotent)
+    book-sync init   <book>            setup + first commit + push to the remote (push-to-create)
+    book-sync clone  <slug> [<dest>]   clone <remote base>/book-<slug>.git into ~/Documents/notebooks/
+    book-sync save   <book>            commit local changes; no network, never touches the files
+    book-sync push   <book>            save + send; never touches the files; `behind` if the remote
+                                       has changes we do not (then run sync when it is safe)
+    book-sync sync   <book>            save, fetch, merge, push (may rewrite page files)
+    book-sync status <book>            what the last sync found + what is waiting; no network
+    book-sync sync-all                 sync every *.book folder under ~/Documents/notebooks/
+    book-sync merge  <book> <ref>      merge a local ref (one2book-sync's `onenote` branch) with
+                                       everything sync does around a merge; no network
+
+Every command prints exactly one JSON line on stdout, also when it fails:
+
+    {"state": "synced|offline|conflict|error|local|behind", "time": "2024-01-31T14:02:11",
+     "changed": [paths the merge changed in the working tree], "conflicts": [conflict page ids],
+     "message": "Merged from laptop", ...extra fields: book, ahead, skipped, busy, books}
+
+Exit status 0 for every state but `error`. The contract is ./README.md; this file's choices
+where the README left room are in its "Notes" section.
+
+<book> is a path to a book folder, or the name of one under ~/Documents/notebooks/ ("Notes"
+or "Notes.book"). Environment: BOOK_SYNC_REMOTE_BASE (where book repos live, e.g.
+git@example.com:me; else `git config book-sync.remote`; no default), BOOK_SYNC_NOTEBOOKS (default
+~/Documents/notebooks), BOOK_SYNC_DEVICE (default from the hostname), BOOK_SYNC_LOCK_TIMEOUT
+(default 30 s), BOOK_SYNC_GRACE (default 10 s, see reconcile), BOOK_SYNC_STARTED_BY (X0urnal++
+on Windows sets it, see open_elsewhere).
+"""
+
+import contextlib
+try:
+    import fcntl
+except ImportError:          # Windows: no flock, msvcrt's locking instead (see "Windows" below)
+    fcntl = None
+    import msvcrt
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import traceback
+
+HERE = os.path.dirname(os.path.realpath(__file__))   # the real folder, through any symlink
+sys.path.insert(0, HERE)
+
+import booklib as bl  # noqa: E402
+
+LOCK_NAME = "book-sync.lock"
+STATE_FILE = "state.json"
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+LOCK_WAIT = _env_float("BOOK_SYNC_LOCK_TIMEOUT", 30)
+GRACE = _env_float("BOOK_SYNC_GRACE", 10)
+FETCH_TIMEOUT = 900     # backstops; an unreachable remote fails in ConnectTimeout (15 s) anyway
+PUSH_TIMEOUT = 1800     # a first push of a big imported book can take a while
+
+# Options for every git call. A book repo must not depend on how ~/.gitconfig is set up: rerere
+# (if on) could "resolve" a page with a stale recorded resolution, and a global hooks path or
+# commit signing would make a background commit hang or fail.
+GIT_OPTS = [
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "commit.gpgsign=false",
+    "-c", "core.autocrlf=false",
+    "-c", "core.quotepath=false",
+    "-c", "merge.renames=true",
+    "-c", "diff.renames=true",
+    "-c", "rerere.enabled=false",
+    "-c", "rerere.autoupdate=false",
+    "-c", "init.defaultBranch=main",
+    "-c", "advice.detachedHead=false",
+    "-c", "pull.rebase=false",
+    "-c", "color.ui=false",
+    "-c", "gc.autoDetach=false",
+]
+
+SSH_COMMAND = "ssh -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+
+# ssh/git messages that mean "the server could not be reached" (state offline) rather than "the
+# server said no" (state error). LC_ALL=C keeps them in English.
+OFFLINE_SIGNS = (
+    "could not resolve hostname", "name or service not known", "temporary failure in name resolution",
+    "connection timed out", "operation timed out", "timed out", "connection refused",
+    "network is unreachable", "no route to host", "host is down", "connection closed by",
+    "connection reset", "kex_exchange_identification", "broken pipe", "connect to host",
+    "could not resolve host",
+)
+REJECTED_SIGNS = ("[rejected]", "non-fast-forward", "fetch first", "stale info")
+BLOCKED_SIGNS = ("would be overwritten", "untracked working tree files")
+
+GITATTRIBUTES = (
+    "sections/*.xopp  merge=xopp  filter=xopp\n"
+    "trash/*.xopp     merge=xopp  filter=xopp\n"
+    "notebook.xml     merge=notebook\n"
+)
+GITIGNORE_PATTERNS = ["*~", ".*.autosave.xopp", "*.tmp", ".book-sync/"]
+
+
+class Failure(Exception):
+    """Ends the command with state error and this message."""
+
+
+class Interrupted(Exception):
+    pass
+
+
+STOP = []   # the signal number, once SIGTERM/SIGHUP/SIGINT arrived
+
+
+class Blocked(Exception):
+    """git would not merge because local, uncommitted files are in the way (a page mid-write)."""
+
+
+class GitError(Failure):
+    def __init__(self, args, r):
+        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        tail = " / ".join(x.strip() for x in err[-3:] if x.strip()) or "exit %d" % r.returncode
+        super().__init__("git %s: %s" % (args[0] if args else "", tail))
+        self.stderr = "\n".join(err)
+        self.returncode = r.returncode
+
+
+# ---- git --------------------------------------------------------------------------------------
+
+
+class Git:
+    def __init__(self, top):
+        self.top = top
+        self._ssh = None
+
+    @staticmethod
+    def env(extra=None):
+        e = dict(os.environ)
+        # whatever git context book-sync was started from must not redirect it
+        for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                  "GIT_PREFIX", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "LANGUAGE"):
+            e.pop(k, None)
+        e.update({"GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "GIT_MERGE_AUTOEDIT": "no", "GIT_EDITOR": "true"})
+        if extra:
+            e.update(extra)
+        return e
+
+    def ssh_opts(self):
+        """Fail fast and never prompt when the server is away -- unless an own ssh command is
+        configured (GIT_SSH_COMMAND, core.sshCommand), which then wins."""
+        if self._ssh is None:
+            self._ssh = []
+            if not os.environ.get("GIT_SSH_COMMAND") and not os.environ.get("GIT_SSH"):
+                r = self.run("config", "--get", "core.sshCommand", check=False)
+                if r.returncode != 0 or not r.stdout.strip():
+                    self._ssh = ["-c", "core.sshCommand=" + SSH_COMMAND]
+        return self._ssh
+
+    def run(self, *args, check=True, input=None, extra_env=None, timeout=600, network=False):
+        """Run one git command to the end. A stop signal (X0urnal++ closing, SIGTERM) is honoured
+        BETWEEN git commands, never by killing one mid-way: a git killed with SIGKILL leaves
+        .git/index.lock behind and every later sync fails. Network commands, which can take
+        minutes, get a plain SIGTERM instead, on which git removes its own lock files."""
+        if STOP:
+            raise Interrupted("stopped by signal %d" % STOP[0])
+        cmd = ["git"]
+        if self.top:
+            cmd += ["-C", self.top]
+        cmd += GIT_OPTS
+        if network:
+            cmd += self.ssh_opts()
+        cmd += list(args)
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env(extra_env), **NO_WINDOW)
+        deadline = time.monotonic() + timeout
+        first = True
+        while True:
+            try:
+                out, err = p.communicate(input=input if first else None, timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                first = False
+                late = time.monotonic() > deadline
+                if late or (STOP and network):
+                    p.terminate()
+                    try:
+                        p.communicate(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.communicate()
+                    if late:
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    raise Interrupted("stopped by signal %d" % STOP[0])
+        r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+        if check and r.returncode != 0:
+            raise GitError(list(args), r)
+        return r
+
+    def out(self, *args, **kw):
+        return self.run(*args, **kw).stdout.decode("utf-8", "replace")
+
+    def ok(self, *args, **kw):
+        return self.run(*args, check=False, **kw).returncode == 0
+
+
+def classify(stderr):
+    s = (stderr or "").lower()
+    if any(x in s for x in OFFLINE_SIGNS):
+        return "offline"
+    return "error"
+
+
+def last_line(stderr):
+    lines = [x.strip() for x in (stderr or "").splitlines() if x.strip()]
+    meaningful = [x for x in lines if not x.lower().startswith(("hint:", "please make sure", "and the repository exists"))]
+    return (meaningful or lines or ["no message"])[-1]
+
+
+def why(stderr):
+    """The line that says what went wrong: for an unreachable server that is ssh's line ("connect to
+    host ... Network is unreachable"), not git's generic "Could not read from remote repository"."""
+    for line in (stderr or "").splitlines():
+        if any(x in line.lower() for x in OFFLINE_SIGNS):
+            return line.strip()
+    return last_line(stderr)
+
+
+def is_local_url(url):
+    # and on Windows a drive path (C:\... or C:/...) or a share (\\host\...): a folder, not "host:path"
+    return url.startswith(("/", "./", "../", "file://", "\\\\")) or (len(url) > 2 and url[1] == ":" and url[2] in "\\/")
+
+
+# ---- the book ---------------------------------------------------------------------------------
+
+
+class Book:
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.git = Git(self.path)
+        self.device = bl.device_name()
+
+    # paths
+    def p(self, rel):
+        return os.path.join(self.path, rel)
+
+    @property
+    def git_dir(self):
+        return self.p(".git")
+
+    @property
+    def state_dir(self):
+        return self.p(bl.STATE_DIR)
+
+    def is_repo(self):
+        return os.path.exists(os.path.join(self.git_dir, "HEAD"))
+
+    # refs
+    def head(self):
+        return self.rev("HEAD")
+
+    def rev(self, ref):
+        r = self.git.run("rev-parse", "-q", "--verify", ref + "^{commit}", check=False)
+        return r.stdout.decode().strip() if r.returncode == 0 else None
+
+    def branch(self):
+        r = self.git.run("symbolic-ref", "--short", "-q", "HEAD", check=False)
+        b = r.stdout.decode().strip()
+        if not b:
+            raise Failure("the book is not on a branch (detached HEAD); fix it with git first")
+        return b
+
+    def upstream(self):
+        return self.rev("refs/remotes/origin/" + self.branch())
+
+    def remote(self):
+        r = self.git.run("config", "--get", "remote.origin.url", check=False)
+        return r.stdout.decode().strip() or None
+
+    def merging(self):
+        return os.path.exists(os.path.join(self.git_dir, "MERGE_HEAD"))
+
+    def is_ancestor(self, a, b):
+        return self.git.ok("merge-base", "--is-ancestor", a, b)
+
+    def author(self, sha):
+        r = self.git.run("log", "-1", "--format=%an", sha, check=False)
+        return r.stdout.decode().strip() or "the server"
+
+    def count(self, rng):
+        r = self.git.run("rev-list", "--count", rng, check=False)
+        try:
+            return int(r.stdout.decode().strip())
+        except ValueError:
+            return 0
+
+    def ahead(self):
+        head = self.head()
+        if head is None:
+            return 0
+        up = self.upstream() if self.remote() else None
+        return self.count("%s..HEAD" % up if up else "HEAD")
+
+    def blob(self, spec):
+        r = self.git.run("cat-file", "blob", spec, check=False)
+        return r.stdout if r.returncode == 0 else None
+
+    def diff_names(self, a, b):
+        """Every path that differs between two commits: modified, added and deleted, with renames
+        split into the old and the new path (X0urnal++ needs both)."""
+        if a == b:
+            return set()
+        if a is None:
+            out = self.git.out("ls-tree", "-r", "--name-only", "-z", b)
+        else:
+            out = self.git.out("diff", "--name-only", "--no-renames", "-z", a, b)
+        return {x for x in out.split("\0") if x}
+
+    # local state
+    def read_state(self):
+        try:
+            with open(os.path.join(self.state_dir, STATE_FILE), encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def write_state(self, **kw):
+        st = self.read_state()
+        st.update(kw)
+        bl.write_atomic(os.path.join(self.state_dir, STATE_FILE), (json.dumps(st, indent=1) + "\n").encode())
+
+
+def resolve_book(arg):
+    p = os.path.abspath(os.path.expanduser(arg))
+    if os.path.isdir(p):
+        return p
+    if os.path.isfile(p):
+        raise Failure("%s is a file (a zip .book?); X0urnal++ imports it into a folder book first" % arg)
+    if "/" not in arg:
+        nb = bl.notebooks_dir()
+        for cand in (os.path.join(nb, arg), os.path.join(nb, arg + ".book")):
+            if os.path.isdir(cand):
+                return cand
+    raise Failure("no such book: %s" % arg)
+
+
+@contextlib.contextmanager
+def locked(book):
+    """flock on .git/book-sync.lock, waiting up to 30 s (README "Locking"). X0urnal++, sync-all
+    and the OneNote import all go through this, so git never runs twice in one book. The lock
+    file is opened close-on-exec so no git child keeps it after we are gone. The lock lives in
+    .git, so a folder that is not a repo yet is made one first (git init is safe to repeat)."""
+    ensure_repo(book)
+    fd = os.open(os.path.join(book.git_dir, LOCK_NAME), os.O_RDWR | os.O_CREAT | O_PRIVATE, 0o644)
+    deadline = time.monotonic() + LOCK_WAIT
+    held = False
+    try:
+        while True:
+            if try_lock(fd):
+                held = True
+                break
+            else:
+                if time.monotonic() >= deadline:
+                    raise Failure("busy: something else has held this book's lock for %g s; try again" % LOCK_WAIT)
+                if STOP:
+                    raise Interrupted("stopped by signal %d while waiting for the lock" % STOP[0])
+                time.sleep(0.05)
+        clear_stale_git_locks(book)
+        yield
+    finally:
+        if held:
+            unlock(fd)
+        os.close(fd)   # closing the descriptor releases the lock too
+
+
+STALE_LOCKS = ("index.lock", "HEAD.lock", "config.lock", "packed-refs.lock", "MERGE_HEAD.lock", "ORIG_HEAD.lock")
+
+
+def clear_stale_git_locks(book, age=60):
+    """git's own lock files that a crashed or killed git left behind. With our flock held no
+    book-sync is running git here, so a git lock file older than a minute belongs to nobody;
+    left alone it would make every later sync fail with "index.lock exists". X0urnal++'s
+    .git/x0urnal.lock and our book-sync.lock are not touched."""
+    now = time.time()
+    cands = [os.path.join(book.git_dir, n) for n in STALE_LOCKS]
+    for sub in ("refs/heads", "refs/remotes/origin"):
+        d = os.path.join(book.git_dir, sub)
+        if os.path.isdir(d):
+            cands += [os.path.join(d, n) for n in os.listdir(d) if n.endswith(".lock")]
+    for p in cands:
+        try:
+            if now - os.stat(p).st_mtime > age:
+                os.unlink(p)
+                sys.stderr.write("book-sync: removed a stale %s\n" % os.path.relpath(p, book.path))
+        except OSError:
+            pass
+
+
+def lock_busy(book):
+    """True if someone holds the lock right now (status uses this; it never waits)."""
+    path = os.path.join(book.git_dir, LOCK_NAME)
+    if not os.path.exists(path):
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR | O_PRIVATE)
+    except OSError:
+        return False
+    try:
+        if try_lock(fd):
+            unlock(fd)
+            return False
+        return True
+    finally:
+        os.close(fd)
+
+
+# ---- setup -------------------------------------------------------------------------------------
+
+
+# ---- Windows ------------------------------------------------------------------------------------
+# Three things differ there, and nothing else in book-sync knows which system it is on:
+#   locks   flock does not exist; msvcrt's byte-range lock on byte 0 of the same lock file does the
+#           same job (exclusive, non-blocking, gone when the descriptor closes)
+#   windows X0urnal++ starts book-sync through pythonw (no console), and every console program a
+#           window-less process starts gets a console window of its own -- one black flash per git
+#           command -- unless it is started with CREATE_NO_WINDOW
+#   drivers git for Windows runs merge drivers through its own sh, which runs a script by its
+#           shebang only if a python3 happens to be on its PATH: always name this Python instead
+WINDOWS = os.name == "nt"
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else {}
+O_PRIVATE = getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOINHERIT", 0)   # never inherited by git
+
+
+def rmtree(path):
+    """shutil.rmtree that also clears what git leaves read-only (pack files): on Windows a read-only
+    file cannot be deleted, and ignore_errors would leave the folder behind."""
+    def again(func, p, _exc):
+        try:
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=again)
+    else:
+        shutil.rmtree(path, onerror=again)
+
+
+def try_lock(fd, shared=False):
+    """Take this book's lock without waiting: True, or False if someone else holds it."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def unlock(fd):
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+def tool_cmd(name):
+    """How git should start one of our scripts: its absolute REAL path (symlinks resolved), shell-
+    quoted because git runs drivers through sh. Not by name on PATH: X0urnal++ started from the
+    desktop often has no ~/bin or ~/.local/bin on its PATH, and a merge driver that is not found
+    makes git fall back to its own text merge of the page. If the script lost its executable bit,
+    run it through this Python. Every book-sync run re-checks these paths, so moving the book-sync
+    folder heals itself at the next sync."""
+    path = os.path.join(HERE, name)
+    if WINDOWS:     # forward slashes: sh and Windows both take them, and nothing has to be escaped
+        return "%s %s" % (shlex.quote(sys.executable.replace("\\", "/")), shlex.quote(path.replace("\\", "/")))
+    if os.access(path, os.X_OK):
+        return shlex.quote(path)
+    return "%s %s" % (shlex.quote(sys.executable), shlex.quote(path))
+
+
+def wanted_config(book):
+    return [
+        ("merge.xopp.name", "book-sync page merge (per stroke)"),
+        ("merge.xopp.driver", "%s %%O %%A %%B %%P" % tool_cmd("xopp-merge")),
+        ("merge.notebook.name", "book-sync notebook tree merge"),
+        ("merge.notebook.driver", "%s %%O %%A %%B" % tool_cmd("notebook-merge")),
+        ("filter.xopp.clean", "%s clean" % tool_cmd("xopp-filter")),
+        ("filter.xopp.smudge", "%s smudge" % tool_cmd("xopp-filter")),
+        ("filter.xopp.process", "%s process" % tool_cmd("xopp-filter")),
+        # not required: if the filter ever fails, git stores/checks out the bytes as they are,
+        # which is still every stroke; refusing the commit would be worse
+        ("filter.xopp.required", "false"),
+        ("user.name", book.device),
+        # Git for Windows turns LF into CRLF on checkout by default (core.autocrlf=true): pages and
+        # notebook.xml would then differ from what was committed. book-sync's own git calls already
+        # say false (GIT_OPTS); this is for every other git that runs in a book
+        ("core.autocrlf", "false"),
+    ]
+
+
+def ensure_repo(book):
+    if not book.is_repo():
+        book.git.run("init", "-q", "-b", "main")
+
+
+def setup_config(book):
+    """Write the driver/filter settings into .git/config, only where they differ, so running setup
+    again changes nothing (not even the file's mtime)."""
+    r = book.git.run("config", "--local", "--list", "-z", check=False)
+    current = {}
+    for item in r.stdout.decode("utf-8", "replace").split("\0"):
+        if "\n" in item:
+            k, v = item.split("\n", 1)
+            current[k] = v
+    for k, v in wanted_config(book):
+        if current.get(k) != v:
+            book.git.run("config", "--local", k, v)
+    if not current.get("user.email"):
+        book.git.run("config", "--local", "user.email", "%s@book-sync" % book.device)
+
+
+def _norm_lines(text):
+    return {" ".join(x.split()) for x in text.splitlines() if x.strip() and not x.lstrip().startswith("#")}
+
+
+def setup_files(book):
+    """.gitattributes and .gitignore. Written as the README spells them when missing; when present
+    (another tool may write them too) only the missing rules are appended, so the tools never
+    fight over spacing. Returns True if .gitattributes changed."""
+    changed = False
+    ga = book.p(".gitattributes")
+    have = ""
+    if os.path.exists(ga):
+        with open(ga, encoding="utf-8", errors="replace") as f:
+            have = f.read()
+    missing = [x for x in GITATTRIBUTES.splitlines() if " ".join(x.split()) not in _norm_lines(have)]
+    if missing:
+        text = GITATTRIBUTES if not have.strip() else have + ("" if have.endswith("\n") else "\n") + "\n".join(missing) + "\n"
+        bl.write_atomic(ga, text.encode())
+        changed = True
+    gi = book.p(".gitignore")
+    have = ""
+    if os.path.exists(gi):
+        with open(gi, encoding="utf-8", errors="replace") as f:
+            have = f.read()
+    present = {x.strip() for x in have.splitlines()}
+    miss = [x for x in GITIGNORE_PATTERNS if x not in present]
+    if miss:
+        text = have + ("" if not have or have.endswith("\n") else "\n") + "\n".join(miss) + "\n"
+        bl.write_atomic(gi, text.encode())
+    return changed
+
+
+def setup_full(book):
+    setup_config(book)
+    if setup_files(book) and book.head():
+        # a book that had history before the filter existed: store its pages as plain XML from
+        # the next commit on (the old gzip blobs stay valid; the drivers read both)
+        book.git.run("add", "--renormalize", "--", ".", check=False)
+
+
+def setup_light(book):
+    """save/push: settings only. They must not touch the working tree; a book that was never set
+    up gets the full setup once (that creates .gitattributes/.gitignore, never a page)."""
+    if not book.is_repo():
+        ensure_repo(book)
+        setup_full(book)
+    else:
+        setup_config(book)
+
+
+# ---- saving ------------------------------------------------------------------------------------
+
+
+def worktree_changes(book):
+    out = book.git.out("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
+    res = []
+    for item in out.split("\0"):
+        if len(item) > 3:
+            res.append((item[:2], item[3:]))
+    return res
+
+
+def unready(book, paths):
+    """Page files (and notebook.xml) that are not complete yet: a gzip cut short, XML that stops
+    halfway. X0urnal++ may be writing one at the very moment save runs; committing it would put
+    half a page in the history (and a merge would then see an unreadable version)."""
+    bad = []
+    for rel in paths:
+        if not bl.needs_check(rel):
+            continue
+        full = book.p(rel)
+        if not os.path.isfile(full):
+            continue   # deleted: a real change
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            bad.append(rel)
+            continue
+        if not bl.file_ok(rel, data):
+            bad.append(rel)
+    return sorted(bad)
+
+
+def stage_all(book):
+    """git add -A for exactly the changed paths that passed the check -- named one by one, so a
+    file that appears between the check and the add is left for next time. Returns the skipped
+    paths."""
+    changes = worktree_changes(book)
+    paths = [p for _, p in changes]
+    skipped = unready(book, paths)
+    # only paths whose working-tree side differs from the index need adding; a change that is
+    # already staged (a merge stages its own results) has nothing to add, and naming a path that
+    # is neither in the index nor on disk makes git add fail
+    good = [p for xy, p in changes if (xy[1] != " " or xy == "??") and p not in set(skipped)]
+    if good:
+        book.git.run("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul",
+                     input=b"\0".join(p.encode("utf-8", "surrogateescape") for p in good),
+                     extra_env={"GIT_LITERAL_PATHSPECS": "1"})
+    if skipped:
+        staged = staged_paths(book)
+        back = [p for p in skipped if p in staged]
+        if back:
+            # staged earlier (setup's renormalize, an interrupted run): put the index back
+            if book.head():
+                book.git.run("reset", "-q", "HEAD", "--", *[":(literal)" + p for p in back], check=False)
+            else:
+                book.git.run("rm", "--cached", "-q", "--ignore-unmatch", "--", *[":(literal)" + p for p in back], check=False)
+    return skipped
+
+
+def staged_paths(book):
+    args = ["diff", "--cached", "--name-only", "--no-renames", "-z"]
+    if book.head():
+        args.append("HEAD")
+    return {x for x in book.git.out(*args).split("\0") if x}
+
+
+def page_count(paths):
+    """How many pages a set of changed paths touches: distinct page ids, so a page moved to the
+    trash (sections/x + trash/x) counts once."""
+    ids = set()
+    for p in paths:
+        if p.endswith(".xopp") and (p.startswith("sections/") or p.startswith("trash/")):
+            ids.add(os.path.basename(p)[: -len(".xopp")])
+    return len(ids)
+
+
+def commit(book, message):
+    r = book.git.run("config", "--get", "user.email", check=False)
+    email = r.stdout.decode().strip() or "%s@book-sync" % book.device
+    env = {"GIT_AUTHOR_NAME": book.device, "GIT_AUTHOR_EMAIL": email,
+           "GIT_COMMITTER_NAME": book.device, "GIT_COMMITTER_EMAIL": email}
+    book.git.run("commit", "-q", "--no-verify", "-m", message, extra_env=env)
+
+
+def save_changes(book):
+    """Commit what changed, as "<device>: <n> pages" (README "Commits"). Returns (pages, skipped,
+    committed). Never touches the working tree."""
+    skipped = stage_all(book)
+    staged = staged_paths(book)
+    if not staged and not book.merging():
+        return 0, skipped, False
+    n = page_count(staged)
+    commit(book, "%s: %d pages" % (book.device, n))
+    return n, skipped, True
+
+
+# ---- after a merge: conflict pages, deleted-but-edited pages, orphans ----------------------------
+
+
+def _find(children, nid):
+    for k, c in enumerate(children):
+        if isinstance(c, bl.Node):
+            if c.id == nid:
+                return children, k
+            hit = _find(c.children, nid)
+            if hit:
+                return hit
+    return None
+
+
+def _all_ids(nb):
+    out = set()
+
+    def walk(ch):
+        for c in ch:
+            if isinstance(c, bl.Node):
+                out.add(c.id)
+                walk(c.children)
+
+    walk(nb.children)
+    return out
+
+
+def recovered_chapter(nb):
+    hit = _find(nb.children, bl.RECOVERED_ID)
+    if hit:
+        return hit[0][hit[1]]
+    ch = bl.Node("chapter", {"id": bl.RECOVERED_ID, "title": bl.RECOVERED_TITLE})
+    nb.children.append(ch)
+    return ch
+
+
+def insert_conflict(nb, orig_id, node):
+    """Right after the original -- and after conflict pages of it that are already there, so they
+    stay in the order they happened."""
+    hit = _find(nb.children, orig_id)
+    if not hit:
+        recovered_chapter(nb).children.append(node)
+        return
+    lst, k = hit
+    j = k + 1
+    while j < len(lst) and isinstance(lst[j], bl.Node) and (bl.parse_conflict_id(lst[j].id) or ("",))[0] == orig_id:
+        j += 1
+    lst.insert(j, node)
+
+
+def place_like(nb, side_idx, side_order, nid):
+    """Put node `nid` into `nb` where it is in another version of the tree (side_idx/side_order),
+    bringing back its chapters if they are gone, next to the same neighbours."""
+    info = side_idx[nid]
+    if info.parent is None:
+        container = nb.children
+    else:
+        hit = _find(nb.children, info.parent)
+        if hit:
+            container = hit[0][hit[1]].children
+        elif info.parent in side_idx:
+            container = place_like(nb, side_idx, side_order, info.parent).children
+        else:
+            container = recovered_chapter(nb).children
+    node = bl.Node(info.node.tag, dict(info.node.attrs))
+    sibs = side_order.get(info.parent, [])
+    k = sibs.index(nid) if nid in sibs else len(sibs)
+    here = [c.id if isinstance(c, bl.Node) else None for c in container]
+    for prev in reversed(sibs[:k]):
+        if prev in here:
+            container.insert(here.index(prev) + 1, node)
+            return node
+    for nxt in sibs[k + 1:]:
+        if nxt in here:
+            container.insert(here.index(nxt), node)
+            return node
+    container.append(node)
+    return node
+
+
+def ls_pages(book, commit_sha):
+    out = book.git.out("ls-tree", "-r", "-z", commit_sha, "--", "sections", "trash")
+    res = {}
+    for item in out.split("\0"):
+        if "\t" in item:
+            meta, path = item.split("\t", 1)
+            res[path] = meta.split()[2]
+    return res
+
+
+def tree_at(book, commit_sha):
+    data = book.blob("%s:notebook.xml" % commit_sha)
+    try:
+        nb = bl.parse_notebook(data or b"")
+    except ValueError:
+        nb = bl.empty_notebook()
+    return bl.index_notebook(nb)
+
+
+class Reconcile:
+    """Bring the tree and the files back into agreement after a merge (and before one).
+
+    In order:
+      1. (after a merge) a page deleted on one side -- out of the tree, file to trash/ or gone --
+         but edited on the other is put back: file into sections/, node into the tree where the
+         editing side had it (README "Never loses data", trash handling)
+      2. conflict pages the drivers made go into the tree right after their original
+      3. a tree node whose file is missing but sits in trash/ gets its file back
+      4. a page file in sections/ the tree does not mention goes under "Recovered"
+    Steps 3 and 4 leave alone files younger than BOOK_SYNC_GRACE seconds (10) that the merge did
+    not bring: X0urnal++ may be halfway through creating or removing a page."""
+
+    def __init__(self, book, ctx=None, touched=(), grace=None):
+        self.book = book
+        self.ctx = ctx
+        self.touched = set(touched)
+        self.grace = GRACE if grace is None else grace
+        self.changed = set()
+        self.created = []
+        self.notes = []
+
+    def settled(self, rel):
+        if rel in self.touched or self.grace <= 0:
+            return True
+        try:
+            st = os.stat(self.book.p(rel))
+        except OSError:
+            return True
+        return time.time() - max(st.st_mtime, st.st_ctime) >= self.grace
+
+    def load_tree(self):
+        path = self.book.p("notebook.xml")
+        if not os.path.exists(path):
+            title = os.path.basename(self.book.path)
+            title = title[: -len(".book")] if title.endswith(".book") else title
+            return bl.empty_notebook(title), True
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            return bl.parse_notebook(data), False
+        except ValueError:
+            if self.ctx is None:
+                return None, False   # maybe mid-write; the next sync tries again
+            # the merged tree is unreadable (both sides were): keep it beside, start from ours
+            keep = "notebook.xml.broken-%s" % bl.base36(int(time.time() * 1000))
+            bl.write_atomic(self.book.p(keep), data)
+            self.changed.add(keep)
+            self.notes.append("notebook.xml could not be read after the merge; kept as %s" % keep)
+            ours = self.book.blob("%s:notebook.xml" % self.ctx[1])
+            try:
+                return bl.parse_notebook(ours or b""), True
+            except ValueError:
+                return bl.empty_notebook(os.path.basename(self.book.path)[:-5]), True
+
+    def run(self):
+        book = self.book
+        nb, fresh = self.load_tree()
+        if nb is None:
+            self.notes.append("notebook.xml is not complete right now; left for the next sync")
+            return self
+        before = None if fresh else bl.serialize_notebook(nb)
+        recs = bl.read_pending(book.path, bl.PENDING_CONFLICTS)
+        titles = {}
+        for t in bl.read_pending(book.path, bl.PENDING_TITLES):
+            titles[t.get("id")] = t
+        if self.ctx and self.ctx[0]:
+            self.restore_deleted_but_edited(nb, recs)
+        self.add_conflicts(nb, recs, titles)
+        self.restore_from_trash(nb)
+        self.recover_orphans(nb)
+        after = bl.serialize_notebook(nb)
+        if after != before:
+            bl.write_atomic(book.p("notebook.xml"), after)
+            self.changed.add("notebook.xml")
+        # only now, with the tree written, are the records done with
+        bl.clear_pending(book.path, bl.PENDING_CONFLICTS)
+        bl.clear_pending(book.path, bl.PENDING_TITLES)
+        return self
+
+    def restore_deleted_but_edited(self, nb, recs):
+        book = self.book
+        base, ours, theirs = self.ctx
+        trees = {c: tree_at(book, c) for c in (base, ours, theirs)}
+        files = {c: ls_pages(book, c) for c in (base, ours, theirs)}
+        b_idx = trees[base][0]
+        cand = {i for i, inf in b_idx.items() if inf.node.tag == "section"}
+        cand |= {os.path.basename(p)[:-5] for p in files[base] if p.startswith("sections/") and p.endswith(".xopp")}
+        for sid in sorted(cand):
+            rel = bl.section_file(sid)
+            b_blob = files[base].get(rel)
+            for gone, kept in ((ours, theirs), (theirs, ours)):
+                g_idx = trees[gone][0]
+                k_idx, k_order = trees[kept]
+                if sid in g_idx and g_idx[sid].node.tag == "section":
+                    continue                         # not deleted on that side
+                k_blob = files[kept].get(rel)
+                if sid not in k_idx or k_blob is None or k_blob == b_blob:
+                    continue                         # not edited on the other side
+                self.keep_page(nb, sid, k_idx, k_order, k_blob, recs)
+                break
+
+    def keep_page(self, nb, sid, k_idx, k_order, k_blob, recs):
+        book = self.book
+        rel = bl.section_file(sid)
+        trash_rel = "trash/%s.xopp" % sid
+        if not os.path.exists(book.p(rel)):
+            if os.path.exists(book.p(trash_rel)):
+                # git followed the move into the trash and merged the edits there
+                os.replace(book.p(trash_rel), book.p(rel))
+                self.changed.update((rel, trash_rel))
+            else:
+                bl.write_atomic(book.p(rel), bl.smudge_bytes(book.blob(k_blob) or b""))
+                self.changed.add(rel)
+            # a conflict page made for it inside the trash comes back with it
+            for r in recs:
+                if r.get("path") == trash_rel and os.path.exists(book.p(r.get("file", ""))):
+                    new = bl.section_file(r["id"])
+                    os.replace(book.p(r["file"]), book.p(new))
+                    self.changed.update((r["file"], new))
+                    r["file"], r["path"] = new, rel
+        if sid not in _all_ids(nb):
+            place_like(nb, k_idx, k_order, sid)
+            self.notes.append("kept %s: deleted on one side, edited on the other" % k_idx[sid].node.title())
+
+    def add_conflicts(self, nb, recs, titles):
+        ids = _all_ids(nb)
+        used_titles = set()
+        for r in recs:
+            f, cid, orig = r.get("file", ""), r.get("id"), r.get("of")
+            if not cid or not f.startswith("sections/") or cid in ids or not os.path.exists(self.book.p(f)):
+                continue
+            hit = _find(nb.children, orig)
+            base_title = hit[0][hit[1]].title() if hit else orig
+            if orig in titles and titles[orig].get("theirs"):
+                base_title = titles[orig]["theirs"]
+                used_titles.add(orig)
+            title = bl.conflict_title(base_title, r.get("device", "other"), float(r.get("when") or time.time()))
+            insert_conflict(nb, orig, bl.Node("section", {"id": cid, "title": title, "file": f}))
+            ids.add(cid)
+            self.created.append(cid)
+            self.changed.add(f)
+        for nid, t in titles.items():
+            if nid not in used_titles and t.get("theirs") is not None:
+                self.notes.append('kept the title "%s"; the other side had renamed it "%s"' % (t.get("ours"), t.get("theirs")))
+
+    def restore_from_trash(self, nb):
+        book = self.book
+        for node in bl.sections_of(nb):
+            rel = node.attrs.get("file") or bl.section_file(node.id)
+            if os.path.exists(book.p(rel)):
+                continue
+            trash_rel = "trash/" + os.path.basename(rel)
+            if os.path.exists(book.p(trash_rel)) and self.settled(trash_rel) and self.settled("notebook.xml"):
+                os.makedirs(os.path.dirname(book.p(rel)), exist_ok=True)
+                os.replace(book.p(trash_rel), book.p(rel))
+                self.changed.update((rel, trash_rel))
+                self.notes.append("took %s back out of the trash (the tree still has it)" % node.title())
+
+    def recover_orphans(self, nb):
+        book = self.book
+        sec = book.p("sections")
+        if not os.path.isdir(sec):
+            return
+        sections = bl.sections_of(nb)
+        referenced = {n.attrs.get("file") or bl.section_file(n.id) for n in sections}
+        referenced |= {bl.section_file(n.id) for n in sections}
+        ids = _all_ids(nb)
+        recovered = 0
+        for name in sorted(os.listdir(sec)):
+            if name.startswith(".") or not name.endswith(".xopp"):
+                continue
+            rel = "sections/" + name
+            sid = name[: -len(".xopp")]
+            if rel in referenced or sid in ids or not os.path.isfile(book.p(rel)):
+                continue
+            if not self.settled(rel) or not self.settled("notebook.xml"):
+                continue
+            with open(book.p(rel), "rb") as f:
+                data = f.read()
+            if not bl.page_file_ok(data):
+                continue   # being written; not a page yet
+            pc = bl.parse_conflict_id(sid)
+            if pc and _find(nb.children, pc[0]):
+                hit = _find(nb.children, pc[0])
+                title = bl.conflict_title(hit[0][hit[1]].title(), pc[1], pc[2])
+                insert_conflict(nb, pc[0], bl.Node("section", {"id": sid, "title": title, "file": rel}))
+                self.created.append(sid)
+            else:
+                title = bl.xopp_title(data) or sid
+                recovered_chapter(nb).children.append(bl.Node("section", {"id": sid, "title": title, "file": rel}))
+                recovered += 1
+            ids.add(sid)
+        if recovered:
+            self.notes.append("put %d page%s that the tree did not list under Recovered" % (recovered, "" if recovered == 1 else "s"))
+
+
+# ---- merging -----------------------------------------------------------------------------------
+
+
+def resolve_unmerged(book):
+    """Settle what git left unmerged. With our drivers that is only what no driver sees:
+    modify/delete (a page deleted on one side, changed on the other -> keep the changed one),
+    and anything a driver could not handle. Never "theirs wins", never a half-merged file."""
+    out = book.git.out("ls-files", "-u", "-z")
+    groups = {}
+    for item in out.split("\0"):
+        if "\t" not in item:
+            continue
+        meta, path = item.split("\t", 1)
+        _, sha, stage = meta.split()
+        groups.setdefault(path, {})[int(stage)] = sha
+    for path, st in sorted(groups.items()):
+        s1, s2, s3 = st.get(1), st.get(2), st.get(3)
+        full = book.p(path)
+        page = path.endswith(".xopp")
+
+        def put(data):
+            bl.write_atomic(full, bl.smudge_bytes(data) if page else data)
+
+        if s2 and s3:
+            ours, theirs = book.blob(s2) or b"", book.blob(s3) or b""
+            if page:
+                merged, reason = bl.merge_xopp(book.blob(s1) if s1 else None, ours, theirs)
+                put(merged)
+                if reason:
+                    bl.make_conflict_page(book.path, path, theirs)
+            elif path == "notebook.xml":
+                try:
+                    nb_a = bl.parse_notebook(ours)
+                    nb_t = bl.parse_notebook(theirs)
+                    try:
+                        nb_b = bl.parse_notebook(book.blob(s1) or b"") if s1 else bl.empty_notebook()
+                    except ValueError:
+                        nb_b = bl.empty_notebook()
+                    merged, titles = bl.merge_notebooks(nb_b, nb_a, nb_t)
+                    put(bl.serialize_notebook(merged))
+                    for nid, a, t in titles:
+                        bl.add_pending(book.path, bl.PENDING_TITLES, {"id": nid, "ours": a, "theirs": t})
+                except ValueError:
+                    put(ours)
+            else:
+                put(ours)
+            book.git.run("add", "--", ":(literal)" + path)
+        elif s2 or s3:
+            put(book.blob(s2 or s3) or b"")
+            book.git.run("add", "--", ":(literal)" + path)
+        else:
+            book.git.run("rm", "--cached", "-q", "--ignore-unmatch", "--", ":(literal)" + path, check=False)
+
+
+def merge_ref(book, theirs):
+    """Merge commit `theirs` into the branch. Returns ("none"|"ff"|"merge", ctx) where ctx is
+    (base or None, ours, theirs) for a real merge. Raises Blocked when git will not start because
+    uncommitted files are in the way."""
+    head = book.head()
+    if head is not None and (head == theirs or book.is_ancestor(theirs, head)):
+        return "none", None
+    env = {"BOOK_SYNC_THEIRS": theirs}
+    if head is None or book.is_ancestor(head, theirs):
+        r = book.git.run("merge", "--ff-only", "-q", theirs, check=False, extra_env=env)
+        if r.returncode != 0:
+            err = r.stderr.decode("utf-8", "replace")
+            if any(x in err for x in BLOCKED_SIGNS):
+                raise Blocked(err)
+            raise GitError(["merge"], r)
+        return "ff", (None, head, theirs)
+    base = book.git.run("merge-base", head, theirs, check=False).stdout.decode().strip() or None
+    args = ["merge", "--no-ff", "--no-commit", "-q"]
+    if base is None:
+        args.append("--allow-unrelated-histories")
+    r = book.git.run(*args, theirs, check=False, extra_env=env)
+    if not book.merging():
+        err = r.stderr.decode("utf-8", "replace")
+        if any(x in err for x in BLOCKED_SIGNS):
+            raise Blocked(err)
+        if r.returncode == 0:
+            return "none", None
+        raise GitError(["merge"], r)
+    old = os.environ.get("BOOK_SYNC_THEIRS")
+    os.environ["BOOK_SYNC_THEIRS"] = theirs
+    try:
+        resolve_unmerged(book)
+    finally:
+        if old is None:
+            os.environ.pop("BOOK_SYNC_THEIRS", None)
+        else:
+            os.environ["BOOK_SYNC_THEIRS"] = old
+    return "merge", (base, head, theirs)
+
+
+class Run:
+    """What one command did, for the JSON line."""
+
+    def __init__(self, book):
+        self.book = book
+        self.changed = set()
+        self.conflicts = []
+        self.notes = []
+        self.skipped = []
+        self.merged_from = None
+        self.updated_from = None
+
+    def take(self, rec):
+        self.changed |= rec.changed
+        self.conflicts += [c for c in rec.created if c not in self.conflicts]
+        self.notes += rec.notes
+
+
+def finish_merge(book, run):
+    """Finish what an interrupted sync (killed mid-merge) or a plain `git merge` with conflicts left
+    behind, and reconcile a merge commit nobody reconciled yet (one2book-sync's `git merge`)."""
+    if book.merging():
+        theirs = book.rev("MERGE_HEAD")
+        ours = book.head()
+        base = book.git.run("merge-base", ours, theirs, check=False).stdout.decode().strip() or None
+        os.environ["BOOK_SYNC_THEIRS"] = theirs
+        try:
+            resolve_unmerged(book)
+        finally:
+            os.environ.pop("BOOK_SYNC_THEIRS", None)
+        touched = book.diff_names(ours, theirs)
+        run.take(Reconcile(book, (base, ours, theirs), touched).run())
+        stage_all(book)
+        n = page_count(staged_paths(book))
+        commit(book, "%s: %d pages\n\nMerged from %s" % (book.device, n, book.author(theirs)))
+        run.changed |= book.diff_names(ours, book.head())
+        book.write_state(reconciled=book.head())
+        return
+    head = book.head()
+    if not head or book.read_state().get("reconciled") == head:
+        return
+    parents = book.git.out("rev-list", "--parents", "-n", "1", head).split()
+    if len(parents) == 3:
+        ours, theirs = parents[1], parents[2]
+        base = book.git.run("merge-base", ours, theirs, check=False).stdout.decode().strip() or None
+        rec = Reconcile(book, (base, ours, theirs), book.diff_names(ours, head)).run()
+        run.take(rec)
+        if rec.changed or rec.created:
+            stage_all(book)
+            commit(book, "%s: %d pages" % (book.device, page_count(staged_paths(book))))
+    book.write_state(reconciled=book.head())
+
+
+def merge_and_commit(book, theirs, who, run):
+    """Merge `theirs` with everything around it: drivers, unmerged paths, reconcile, the commit.
+    A Blocked merge is retried a few times (a page mid-write is usually done within a second)."""
+    for attempt in range(3):
+        try:
+            kind, ctx = merge_ref(book, theirs)
+            break
+        except Blocked:
+            if attempt == 2:
+                raise
+            time.sleep(1.0)
+            _, skipped, _ = save_changes(book)
+            run.skipped = skipped
+    if kind == "none":
+        return kind
+    if kind == "ff":
+        run.updated_from = who
+        rec = Reconcile(book, None, book.diff_names(ctx[1], theirs)).run()
+        run.take(rec)
+        if rec.changed:
+            run.skipped = stage_all(book)
+            commit(book, "%s: %d pages" % (book.device, page_count(staged_paths(book))))
+        book.write_state(reconciled=book.head())
+        return kind
+    run.merged_from = who
+    touched = {x for x in book.git.out("diff", "--name-only", "--no-renames", "-z", "HEAD").split("\0") if x}
+    run.take(Reconcile(book, ctx, touched).run())
+    run.skipped = stage_all(book)
+    n = page_count(staged_paths(book))
+    commit(book, "%s: %d pages\n\nMerged from %s" % (book.device, n, who))
+    book.write_state(reconciled=book.head())
+    return kind
+
+
+# ---- the network side --------------------------------------------------------------------------
+
+
+def ensure_local_remote(url):
+    """Push-to-create for a remote that is a local folder (tests, a USB stick): the server creates a
+    repo on its first push; a bare folder has to be made by hand."""
+    if is_local_url(url):
+        path = url[len("file://"):] if url.startswith("file://") else url
+        if not os.path.exists(path):
+            subprocess.run(["git", "init", "-q", "--bare", "-b", "main", path], env=Git.env(),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, **NO_WINDOW)
+
+
+def fetch(book):
+    """(ok, state, message). Timeouts count as offline."""
+    try:
+        r = book.git.run("fetch", "-q", "origin", check=False, network=True, timeout=FETCH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, "offline", "the server did not answer in time"
+    if r.returncode == 0:
+        return True, None, None
+    err = r.stderr.decode("utf-8", "replace")
+    return False, classify(err), why(err)
+
+
+def push(book):
+    """("ok"|"rejected"|"offline"|"error", message)."""
+    branch = book.branch()
+    try:
+        r = book.git.run("push", "-q", "origin", "HEAD:refs/heads/" + branch, check=False, network=True,
+                         timeout=PUSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "offline", "the server did not answer in time"
+    if r.returncode == 0:
+        book.git.run("update-ref", "refs/remotes/origin/" + branch, "HEAD", check=False)
+        return "ok", None
+    err = r.stderr.decode("utf-8", "replace")
+    if any(x in err for x in REJECTED_SIGNS):
+        return "rejected", last_line(err)
+    return classify(err), why(err)
+
+
+def no_remote_message():
+    if bl.remote_base():
+        return "this book has no remote repo yet (book-sync init sends it there)"
+    return "this book stays on this device: no remote configured (%s, then book-sync init)" % bl.NO_REMOTE_HINT
+
+
+def exchange(book, run, mode):
+    """Talk to the remote. mode "sync" merges what it finds; "push" never touches the working tree
+    and answers `behind` instead; "init" pushes first (push-to-create) and merges if the remote
+    already has the book. Returns (state, message)."""
+    url = book.remote()
+    if not url:
+        return "local", no_remote_message()
+    if mode == "init":
+        ensure_local_remote(url)
+        if book.head():
+            res, msg = push(book)
+            if res == "ok":
+                return "synced", "sent to the server"
+            if res != "rejected":
+                return res, msg
+    ok, state, msg = fetch(book)
+    if not ok:
+        if state == "offline":
+            return "offline", msg
+        if book.upstream() is None and book.head():
+            # never fetched anything: the server may not have this book yet (an init that ran
+            # offline) -- a push creates it there (push-to-create)
+            res, pmsg = push(book)
+            if res == "ok":
+                return "synced", "sent to the server (new repo)"
+        return state, msg
+    for _ in range(5):
+        up = book.upstream()
+        head = book.head()
+        if up and up != head and (head is None or not book.is_ancestor(up, head)):
+            who = book.author(up)
+            if mode == "push":
+                return "behind", "%s has newer changes" % who
+            try:
+                merge_and_commit(book, up, who, run)
+            except Blocked as e:
+                files = [x.strip() for x in str(e).splitlines() if x.startswith("\t")]
+                return "behind", "%s has newer changes; not merged yet because %s is being written" % (
+                    who, ", ".join(files) or "a page")
+            head = book.head()
+        if head is None or head == up:
+            return "synced", None
+        res, msg = push(book)
+        if res == "ok":
+            return "synced", "sent to the server"
+        if res != "rejected":
+            return res, msg
+        # someone pushed between our fetch and our push: fetch again
+        ok, state, msg = fetch(book)
+        if not ok:
+            return state, msg
+        if mode == "push":
+            up = book.upstream()
+            return "behind", "%s has newer changes" % (book.author(up) if up else "the server")
+    return "error", "the server kept changing while sending; try again"
+
+
+# ---- commands ----------------------------------------------------------------------------------
+
+
+def unresolved_conflicts(book):
+    try:
+        with open(book.p("notebook.xml"), "rb") as f:
+            nb = bl.parse_notebook(f.read())
+    except (OSError, ValueError):
+        return []
+    return [n.id for n in bl.sections_of(nb) if bl.parse_conflict_id(n.id)]
+
+
+def base_result(book, state, message, run=None):
+    res = {
+        "state": state,
+        "time": bl.now_iso(),
+        "changed": sorted(run.changed) if run else [],
+        "conflicts": list(run.conflicts) if run else [],
+        "message": message or "",
+    }
+    if book is not None:
+        res["book"] = book.path
+        if book.is_repo():
+            try:
+                res["ahead"] = book.ahead()
+            except Exception:
+                pass
+    if run is not None and run.skipped:
+        res["skipped"] = run.skipped
+    return res
+
+
+def compose(run, state, msg):
+    """The message for sync/push/init."""
+    parts = []
+    if run.merged_from:
+        parts.append("Merged from %s" % run.merged_from)
+    elif run.updated_from:
+        parts.append("Updated from %s" % run.updated_from)
+    if run.conflicts:
+        parts.append("%d conflict page%s" % (len(run.conflicts), "" if len(run.conflicts) == 1 else "s"))
+    if state == "offline":
+        parts.append("server unreachable (%s); local changes kept" % msg if msg else "server unreachable; local changes kept")
+    elif msg:
+        parts.append(msg)
+    if not parts:
+        parts.append("Up to date")
+    parts += run.notes
+    if run.skipped:
+        parts.append("not saved yet (being written): %s" % ", ".join(run.skipped))
+    s = "; ".join(parts)
+    return s[:1].upper() + s[1:]
+
+
+def final_state(state, run):
+    if state in ("synced",) and run.conflicts:
+        return "conflict"
+    return state
+
+
+def cmd_setup(book):
+    ensure_repo(book)
+    with locked(book):
+        setup_full(book)
+    return base_result(book, "local" if not book.remote() else status_state(book)[0], "set up for book-sync")
+
+
+def cmd_save(book):
+    run = Run(book)
+    with locked(book):
+        setup_light(book)
+        if book.merging():
+            return base_result(book, "behind", "a merge is waiting to be finished; sync finishes it", run)
+        n, run.skipped, done = save_changes(book)
+    state, _ = status_state(book)
+    msg = ("Saved %d page%s" % (n, "" if n == 1 else "s")) if done else "Nothing to save"
+    if run.skipped:
+        msg += "; not saved yet (being written): %s" % ", ".join(run.skipped)
+    return base_result(book, state, msg, run)
+
+
+def cmd_push(book):
+    run = Run(book)
+    with locked(book):
+        setup_light(book)
+        if book.merging():
+            return base_result(book, "behind", "a merge is waiting to be finished; sync finishes it", run)
+        _, run.skipped, _ = save_changes(book)
+        state, msg = exchange(book, run, "push")
+        book.write_state(state=state, time=bl.now_iso(), message=msg or "")
+    return base_result(book, state, compose(run, state, msg), run)
+
+
+def open_elsewhere(book):
+    """True when X0urnal++ has this book open and we were NOT started by that X0urnal++.
+
+    X0urnal++ holds an exclusive flock on .git/x0urnal.lock for as long as a book is open
+    (NotebookController::acquireLock; on Windows LockFileEx on byte 0, which try_lock tests). Its
+    own syncs run book-sync as its child and reload the tree afterwards, so a merge there is safe.
+    A merge started from anywhere else -- `book-sync sync-all` in a terminal, say -- would rewrite
+    page files under the open window, and the window's next autosave would write its older copy of
+    that page back over the other device's strokes. So from outside, an open book is only sent,
+    never merged.
+
+    Who started us: /proc/<parent>/exe on Linux. Windows has no /proc, and X0urnal++'s child
+    there has no parent left to ask (GLib starts it through gspawn-win64-helper, which exits once
+    it runs), so X0urnal++ says so in BOOK_SYNC_STARTED_BY."""
+    path = os.path.join(book.git_dir, "x0urnal.lock")
+    if not os.path.exists(path):
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR | O_PRIVATE)
+    except OSError:
+        return False
+    try:
+        if try_lock(fd, shared=True):
+            unlock(fd)
+            return False
+        # held: X0urnal++ has it open
+    finally:
+        os.close(fd)
+    parent = os.environ.get("BOOK_SYNC_STARTED_BY", "").lower()
+    if not parent:
+        try:
+            parent = os.path.basename(os.readlink("/proc/%d/exe" % os.getppid())).lower()
+        except OSError:
+            parent = ""
+    return not ("x0urnal" in parent or "xournalpp" in parent)
+
+
+def cmd_sync(book, mode="sync"):
+    run = Run(book)
+    if mode == "sync" and open_elsewhere(book):
+        r = cmd_push(book)
+        r["message"] = ("Open in X0urnal++, so only sent from here; X0urnal++ merges the rest itself. "
+                        + (r.get("message") or "")).strip()
+        return r
+    with locked(book):
+        ensure_repo(book)
+        setup_full(book)
+        finish_merge(book, run)
+        _, run.skipped, _ = save_changes(book)
+        start = book.head()
+        rec = Reconcile(book, None, (), 0 if mode == "init" else None).run()
+        run.take(rec)
+        if rec.changed or rec.created:
+            run.skipped = stage_all(book)
+            commit(book, "%s: %d pages" % (book.device, page_count(staged_paths(book))))
+        if mode == "init" and not book.remote():
+            url = bl.remote_url(bl.book_slug(book.path))
+            if url:     # no remote configured: the book stays local (state "local")
+                book.git.run("remote", "add", "origin", url)
+        state, msg = exchange(book, run, mode)
+        run.changed |= book.diff_names(start, book.head())
+        state = final_state(state, run)
+        book.write_state(state=state, time=bl.now_iso(), message=msg or "")
+    return base_result(book, state, compose(run, state, msg), run)
+
+
+def cmd_merge(book, ref):
+    run = Run(book)
+    with locked(book):
+        ensure_repo(book)
+        setup_full(book)
+        theirs = book.rev(ref)
+        if theirs is None:
+            raise Failure("no such ref: %s" % ref)
+        finish_merge(book, run)
+        _, run.skipped, _ = save_changes(book)
+        start = book.head()
+        rec = Reconcile(book).run()
+        run.take(rec)
+        if rec.changed or rec.created:
+            run.skipped = stage_all(book)
+            commit(book, "%s: %d pages" % (book.device, page_count(staged_paths(book))))
+        who = os.environ.get("BOOK_SYNC_THEIR_DEVICE") or book.author(theirs)
+        try:
+            kind = merge_and_commit(book, theirs, who, run)
+        except Blocked:
+            return base_result(book, "behind", "not merged: a page is being written; try again", run)
+        run.changed |= book.diff_names(start, book.head())
+    state, _ = status_state(book)
+    if run.conflicts:
+        state = "conflict"
+    msg = compose(run, "synced", None if kind != "none" else "%s is already merged" % ref)
+    return base_result(book, state, msg + ("" if not book.remote() else "; not sent yet (sync sends it)"), run)
+
+
+def status_state(book):
+    """(state, message) from local knowledge only."""
+    if not book.is_repo():
+        return "local", "not set up for book-sync yet"
+    if not book.remote():
+        return "local", no_remote_message()
+    conflicts = unresolved_conflicts(book)
+    if conflicts:
+        return "conflict", "%d conflict page%s to look at" % (len(conflicts), "" if len(conflicts) == 1 else "s")
+    if book.merging():
+        return "behind", "a merge is waiting to be finished; sync finishes it"
+    up = book.upstream()
+    head = book.head()
+    if up and head and up != head and not book.is_ancestor(up, head):
+        return "behind", "%s has newer changes" % book.author(up)
+    st = book.read_state()
+    last = st.get("state")
+    if last in ("offline", "error"):
+        return last, st.get("message") or ""
+    return "synced", ""
+
+
+def cmd_status(book):
+    """No lock and no network: read-only git calls (--no-optional-locks keeps `git status` from
+    refreshing the index while a sync runs). `busy` says whether a sync holds the book now."""
+    st = book.read_state()
+    state, msg = status_state(book)
+    res = base_result(book, state, msg)
+    res["conflicts"] = unresolved_conflicts(book) if book.is_repo() else []
+    if book.is_repo():
+        r = book.git.run("--no-optional-locks", "status", "--porcelain", "--untracked-files=all", check=False)
+        res["dirty"] = bool(r.stdout.strip())
+        res["busy"] = lock_busy(book)
+        if st.get("time"):
+            res["time"] = st["time"]
+        bits = [msg] if msg else []
+        if res.get("ahead"):
+            bits.append("%d change%s not on the server yet" % (res["ahead"], "" if res["ahead"] == 1 else "s"))
+        if res["dirty"]:
+            bits.append("unsaved changes")
+        if not bits:
+            bits.append("up to date" + (" as of %s" % st["time"] if st.get("time") else ""))
+        res["message"] = "; ".join(bits)
+        res["message"] = res["message"][:1].upper() + res["message"][1:]
+    return res
+
+
+def cmd_clone(slug, dest):
+    url = bl.remote_url(slug)
+    if not url:
+        raise Failure("no remote configured: " + bl.NO_REMOTE_HINT)
+    nbdir = bl.notebooks_dir()
+    target = None
+    if dest:
+        if "/" in dest or os.sep in dest or os.path.isabs(dest) or dest.startswith("."):   # a path (C:\... on Windows)
+            target = os.path.abspath(os.path.expanduser(dest))
+        else:
+            target = os.path.join(nbdir, dest if dest.endswith(".book") else dest + ".book")
+        if os.path.exists(target):
+            raise Failure("%s already exists" % target)
+    parent = os.path.dirname(target) if target else nbdir
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, ".book-sync-clone-%s" % bl.base36(int(time.time() * 1000)))
+    g = Git(None)
+    try:
+        r = g.run("clone", "-q", "--no-checkout", "--origin", "origin", url, tmp, check=False, network=True,
+                  timeout=PUSH_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        rmtree(tmp)
+        return base_result(None, "offline", "the server did not answer in time")
+    if r.returncode != 0:
+        rmtree(tmp)
+        err = r.stderr.decode("utf-8", "replace")
+        return base_result(None, classify(err), "clone %s: %s" % (url, why(err)))
+    try:
+        book = Book(tmp)
+        setup_config(book)        # the filter must be configured BEFORE the files are checked out
+        if book.head():
+            book.git.run("reset", "-q", "--hard", "HEAD")
+        setup_files(book)
+        if target is None:
+            title = None
+            try:
+                with open(book.p("notebook.xml"), "rb") as f:
+                    title = bl.parse_notebook(f.read()).attrs.get("title")
+            except (OSError, ValueError):
+                pass
+            name = (title or "").replace("/", "-").replace("\0", "").strip().lstrip(".") or slug
+            target = os.path.join(nbdir, name + ".book")
+        if os.path.exists(target):
+            raise Failure("%s already exists" % target)
+        os.rename(tmp, target)
+    except BaseException:
+        rmtree(tmp)
+        raise
+    book = Book(target)
+    book.write_state(state="synced", time=bl.now_iso(), message="cloned", reconciled=book.head())
+    return base_result(book, "synced", "Cloned %s into %s" % (slug, target))
+
+
+def cmd_sync_all():
+    nbdir = bl.notebooks_dir()
+    names = []
+    if os.path.isdir(nbdir):
+        names = sorted(n for n in os.listdir(nbdir)
+                       if n.endswith(".book") and not n.startswith(".") and os.path.isdir(os.path.join(nbdir, n)))
+    books = []
+    for n in names:
+        path = os.path.join(nbdir, n)
+        try:
+            r = cmd_sync(Book(path))
+        except Failure as e:
+            r = base_result(Book(path), "error", str(e))
+        except Exception as e:
+            traceback.print_exc(file=sys.stderr)
+            r = base_result(Book(path), "error", "%s: %s" % (type(e).__name__, e))
+        r["name"] = n
+        books.append(r)
+    rank = ["error", "conflict", "offline", "behind", "synced", "local"]
+    states = [b["state"] for b in books]
+    state = next((s for s in rank if s in states), "local")
+    if states and all(s == "local" for s in states):
+        state = "local"
+    counts = {}
+    for s in states:
+        counts[s] = counts.get(s, 0) + 1
+    msg = "%d book%s" % (len(books), "" if len(books) == 1 else "s")
+    if counts:
+        msg += ": " + ", ".join("%d %s" % (counts[s], s) for s in rank if s in counts)
+    if not books:
+        msg = "no books in %s" % nbdir
+    res = {
+        "state": state,
+        "time": bl.now_iso(),
+        "changed": sorted("%s/%s" % (b["name"], c) for b in books for c in b.get("changed", [])),
+        "conflicts": [c for b in books for c in b.get("conflicts", [])],
+        "message": msg,
+        "books": books,
+    }
+    return res
+
+
+USAGE = __doc__.split("\n\n")[1]
+
+
+def dispatch(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        raise Failure("usage:\n" + USAGE)
+    cmd, args = argv[0], argv[1:]
+    if cmd == "sync-all":
+        return cmd_sync_all()
+    if cmd == "clone":
+        if not 1 <= len(args) <= 2:
+            raise Failure("usage: book-sync clone <slug> [<dest>]")
+        return cmd_clone(args[0], args[1] if len(args) > 1 else None)
+    if cmd == "merge":
+        if len(args) != 2:
+            raise Failure("usage: book-sync merge <book> <ref>")
+        return cmd_merge(Book(resolve_book(args[0])), args[1])
+    table = {"setup": cmd_setup, "save": cmd_save, "push": cmd_push, "sync": cmd_sync,
+             "status": cmd_status, "init": lambda b: cmd_sync(b, "init")}
+    if cmd not in table:
+        raise Failure("unknown command %r; usage:\n%s" % (cmd, USAGE))
+    if len(args) != 1:
+        raise Failure("usage: book-sync %s <book>" % cmd)
+    return table[cmd](Book(resolve_book(args[0])))
+
+
+def _on_signal(signum, frame):
+    # only note it; Git.run stops at the next safe point (see there)
+    if not STOP:
+        STOP.append(signum)
+
+
+def main(argv):
+    for n in ("SIGTERM", "SIGHUP", "SIGINT"):     # Windows has no SIGHUP
+        if hasattr(signal, n):
+            signal.signal(getattr(signal, n), _on_signal)
+    try:
+        res = dispatch(argv)
+    except Failure as e:
+        res = base_result(None, "error", str(e))
+    except (Interrupted, KeyboardInterrupt) as e:
+        res = base_result(None, "error", "interrupted: %s" % (e or "keyboard"))
+    except subprocess.TimeoutExpired as e:
+        res = base_result(None, "error", "git took too long: %s" % e)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        res = base_result(None, "error", "%s: %s" % (type(e).__name__, e))
+    try:
+        sys.stdout.write(json.dumps(res) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+    return 1 if res.get("state") == "error" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

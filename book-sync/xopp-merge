@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""xopp-merge -- git merge driver for book page files (merge=xopp).
+
+    xopp-merge %O %A %B %P        base, ours, theirs, the page's path in the book
+
+Configured by `book-sync setup`. Git calls it only when BOTH sides changed the same page file.
+It merges per page and layer, element by element (booklib.merge_xopp; the rules are in the
+README). When it cannot decide -- the same attribute or text changed differently on both sides,
+a different number of pages or layers, a version that will not parse -- it keeps ours in %A,
+saves theirs as a conflict page beside it and exits 0: the merge goes on, nothing is lost, and
+the conflict page shows up in the tree, to be looked at. Never "theirs wins".
+
+The conflict page also leaves a record in <book>/.book-sync/conflicts.jsonl; `book-sync sync`
+(or `book-sync merge`) reads it and puts the page into notebook.xml right after the original.
+A plain `git merge` with this driver works too: the next `book-sync sync` picks the record up.
+
+Reads gzip or plain XML; writes the result in the form ours came in (git hands drivers the
+cleaned, plain XML when filter=xopp is configured, and stores what the driver writes).
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))   # booklib beside the real file
+
+import booklib  # noqa: E402
+
+
+def _read(p):
+    try:
+        with open(p, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+def main(argv):
+    if len(argv) < 4:
+        sys.stderr.write("usage: xopp-merge %O %A %B [%P]\n")
+        return 2
+    o, a, b = argv[1], argv[2], argv[3]
+    path = argv[4] if len(argv) > 4 else os.path.basename(a)
+    base, ours, theirs = _read(o), _read(a), _read(b)
+    result, reason = booklib.merge_xopp(base or None, ours, theirs)
+    if reason is None:
+        if result != ours:
+            with open(a, "wb") as f:
+                f.write(result)
+        return 0
+    top = booklib.worktree_top()
+    if top is None:
+        # no working tree to put a conflict page in (git merge-tree, a bare repo): let git
+        # report a real conflict rather than drop theirs
+        sys.stderr.write("xopp-merge: %s: %s, and there is no working tree for a conflict page\n" % (path, reason))
+        return 1
+    cid = booklib.make_conflict_page(top, path, theirs)
+    sys.stderr.write("xopp-merge: %s: %s; kept ours, theirs saved as %s\n" % (path, reason, cid))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
